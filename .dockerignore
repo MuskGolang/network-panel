@@ -1,10 +1,41 @@
-golang-backend/public/
-publish_beta.sh
-.gocache
+# VCS / IDE
+.git
+.github
+.idea
+.DS_Store
+
+# Local env / runtime data
 .env
-./docs
-./.release
-./.release-static
-./vite-frontend/node_modules
-./vite-frontend-v2/node_modules
-./scripts/upload_static_to_server.sh
+.env.*
+mysql_data/
+*.db
+
+# Build caches / local toolchains
+.gocache/
+.gocache_*/
+.gomodcache/
+.gopath/
+
+# Local binaries / release outputs
+server
+flux-agent
+network-panel
+network-panel-server
+network-panel-server-*
+.release/
+.release-static/
+
+# Frontend
+vite-frontend/
+vite-frontend/node_modules/
+vite-frontend-v2/node_modules/
+
+# Backend runtime static files generated in old flow
+golang-backend/public/
+
+# Non-build docs/scripts
+docs/
+scripts/upload_static_to_server.sh
+
+# Misc
+*.log

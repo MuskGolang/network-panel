@@ -2,8 +2,10 @@ package controller
 
 import (
 	"bytes"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"net"
 	"net/http"
@@ -24,7 +26,12 @@ import (
 const (
 	cfgSubClashTemplate = "subscription_clash_template"
 	cfgSubSurgeTemplate = "subscription_surge_template"
+	defaultAnyTLSSNI    = "www.docker.com"
+	dockerCAPEMFile     = "docker-site-ca.pem"
+	dockerCACERFile     = "docker-site-ca.cer"
 )
+
+var anyTLSLabelMaskRE = regexp.MustCompile(`(?i)anytls`)
 
 type subProxy struct {
 	ID       int64
@@ -151,6 +158,56 @@ func SubscriptionQX(c *gin.Context) {
 	c.Data(http.StatusOK, "text/plain; charset=utf-8", []byte(cfg))
 }
 
+// SubscriptionAnyTLSCA returns the controller AnyTLS CA certificate.
+// @Summary AnyTLS CA 证书
+// @Tags subscription
+// @Produce application/x-pem-file
+// @Router /api/v1/subscription/anytls-ca [get]
+func SubscriptionAnyTLSCA(c *gin.Context) {
+	token := extractToken(c)
+	if token == "" || !util.ValidateToken(token) {
+		c.Data(http.StatusUnauthorized, "text/plain; charset=utf-8", []byte("ERROR: unauthorized or invalid token"))
+		return
+	}
+	if !isAnyTLSCertFeatureEnabled() {
+		c.Data(http.StatusForbidden, "text/plain; charset=utf-8", []byte("ERROR: controller anytls cert is disabled"))
+		return
+	}
+	_, _, caPEM, err := ensureAnyTLSCA()
+	if err != nil || strings.TrimSpace(caPEM) == "" {
+		c.Data(http.StatusInternalServerError, "text/plain; charset=utf-8", []byte("ERROR: failed to get site CA certificate"))
+		return
+	}
+
+	// Re-encode to canonical PEM (CERTIFICATE block) to ensure import compatibility.
+	block, _ := pem.Decode([]byte(caPEM))
+	if block == nil {
+		c.Data(http.StatusInternalServerError, "text/plain; charset=utf-8", []byte("ERROR: invalid CA PEM content"))
+		return
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		c.Data(http.StatusInternalServerError, "text/plain; charset=utf-8", []byte("ERROR: invalid CA certificate"))
+		return
+	}
+
+	format := strings.ToLower(strings.TrimSpace(c.DefaultQuery("format", "pem")))
+	c.Header("X-Content-Type-Options", "nosniff")
+	switch format {
+	case "cer", "der", "macos", "surge":
+		c.Header("Content-Disposition", "attachment; filename="+dockerCACERFile)
+		c.Data(http.StatusOK, "application/pkix-cert", cert.Raw)
+	default:
+		out := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
+		if len(out) == 0 {
+			c.Data(http.StatusInternalServerError, "text/plain; charset=utf-8", []byte("ERROR: failed to encode CA certificate"))
+			return
+		}
+		c.Header("Content-Disposition", "attachment; filename="+dockerCAPEMFile)
+		c.Data(http.StatusOK, "application/x-pem-file", out)
+	}
+}
+
 func subscriptionItems(c *gin.Context) (model.User, []subProxy, []subSkip, bool) {
 	token := extractToken(c)
 	if token == "" || !util.ValidateToken(token) {
@@ -237,6 +294,7 @@ func subscriptionItems(c *gin.Context) (model.User, []subProxy, []subSkip, bool)
 	}
 	ssMap := map[int64]model.ExitSetting{}
 	anyTLSMap := map[int64]model.AnyTLSSetting{}
+	anyTLSPortEgressMap := map[int64]map[int]string{}
 	if len(outNodeIDList) > 0 {
 		var ss []model.ExitSetting
 		dbpkg.DB.Where("node_id IN ?", outNodeIDList).Find(&ss)
@@ -247,6 +305,23 @@ func subscriptionItems(c *gin.Context) (model.User, []subProxy, []subSkip, bool)
 		dbpkg.DB.Where("node_id IN ?", outNodeIDList).Find(&ats)
 		for _, a := range ats {
 			anyTLSMap[a.NodeID] = a
+		}
+		var atPorts []model.AnyTLSPortEgress
+		dbpkg.DB.Where("node_id IN ?", outNodeIDList).Find(&atPorts)
+		for _, row := range atPorts {
+			if row.Port <= 0 {
+				continue
+			}
+			pm, ok := anyTLSPortEgressMap[row.NodeID]
+			if !ok {
+				pm = map[int]string{}
+				anyTLSPortEgressMap[row.NodeID] = pm
+			}
+			exitIP := ""
+			if row.EgressIP != nil {
+				exitIP = strings.TrimSpace(*row.EgressIP)
+			}
+			pm[row.Port] = exitIP
 		}
 	}
 
@@ -312,6 +387,7 @@ func subscriptionItems(c *gin.Context) (model.User, []subProxy, []subSkip, bool)
 			}
 		}
 		proto, cipher, password, params := resolveExitProtocol(t, ext, ssMap, anyTLSMap)
+		anyTLSEgressFallback := ""
 		if normalizeProtocol(proto) == "anytls" && user.ID > 0 {
 			if paramString(params, "password") == "" {
 				derived := anytlsUserPassword(password, user.ID)
@@ -325,6 +401,41 @@ func subscriptionItems(c *gin.Context) (model.User, []subProxy, []subSkip, bool)
 			} else {
 				password = paramString(params, "password")
 			}
+		}
+		if normalizeProtocol(proto) == "anytls" {
+			password = stripUserPrefix(password)
+			if params != nil {
+				if p := paramString(params, "password"); p != "" {
+					params["password"] = stripUserPrefix(p)
+				}
+			}
+			if params == nil {
+				params = map[string]interface{}{}
+			}
+			anyTLSEgressFallback = normalizeEgressIP(anyTLSParamString(params, "egress-ip"))
+			if anyTLSEgressFallback == "" {
+				mappedExit := false
+				if t.OutNodeID != nil && *t.OutNodeID > 0 && f.OutPort != nil && *f.OutPort > 0 {
+					if pm := anyTLSPortEgressMap[*t.OutNodeID]; len(pm) > 0 {
+						if exitIP, ok := pm[*f.OutPort]; ok {
+							mappedExit = true
+							anyTLSEgressFallback = normalizeEgressIP(exitIP)
+						}
+					}
+				}
+				if !mappedExit {
+					anyTLSEgressFallback = normalizeEgressIP(ptrString(t.OutIP))
+				}
+			}
+			delete(params, "egress-ip")
+			delete(params, "egress_ip")
+			if caPath := strings.TrimSpace(anyTLSParamString(params, "ca-cert-path")); caPath != "" {
+				params["ca-cert-path"] = normalizeSiteCAPath(caPath)
+			}
+			delete(params, "ca_cert_path")
+			delete(params, "ca-cert")
+			delete(params, "ca_cert")
+			params = applyAnyTLSVerifyDefaults(params, "")
 		}
 		if strings.TrimSpace(proto) == "" {
 			skipped = append(skipped, subSkip{
@@ -362,7 +473,7 @@ func subscriptionItems(c *gin.Context) (model.User, []subProxy, []subSkip, bool)
 				ID:     f.ID,
 				Name:   baseName,
 				Group:  baseGroup,
-				Reason: "AnyTLS缺少密码",
+				Reason: "出口协议缺少密码",
 			})
 			continue
 		}
@@ -376,6 +487,36 @@ func subscriptionItems(c *gin.Context) (model.User, []subProxy, []subSkip, bool)
 			continue
 		}
 		group := baseGroup
+		if proto == "anytls" {
+			egresses := parseForwardEgressItems(f.EgressesRaw)
+			if len(egresses) == 0 && anyTLSEgressFallback != "" {
+				egresses = []forwardEgressItem{{IP: anyTLSEgressFallback}}
+			}
+			if len(egresses) == 0 {
+				egresses = []forwardEgressItem{{}}
+			}
+			for _, eg := range egresses {
+				itemParams := cloneStringAnyMap(params)
+				if eg.IP != "" {
+					itemParams["egress-ip"] = eg.IP
+				} else {
+					delete(itemParams, "egress-ip")
+				}
+				name := uniqueName(appendForwardNameSuffix(baseName, eg.Suffix), f.ID, usedNames)
+				items = append(items, subProxy{
+					ID:       f.ID,
+					Name:     name,
+					Group:    group,
+					Type:     proto,
+					Server:   entryHost,
+					Port:     f.InPort,
+					Cipher:   cipher,
+					Password: password,
+					Params:   itemParams,
+				})
+			}
+			continue
+		}
 		name := uniqueName(baseName, f.ID, usedNames)
 		items = append(items, subProxy{
 			ID:       f.ID,
@@ -500,6 +641,13 @@ func resolveExitProtocol(t model.Tunnel, ext *model.ExitNodeExternal, ssMap map[
 		if proto == "" {
 			proto = normalizeProtocol(ptrString(t.Protocol))
 		}
+		if proto == "anytls" {
+			outID := outNodeIDOr0(t)
+			if outID == 0 && t.InNodeID > 0 {
+				outID = t.InNodeID
+			}
+			params = applyAnyTLSVerifyDefaults(params, getAnyTLSCertDomain(outID))
+		}
 		return proto, "", "", params
 	}
 	outID := outNodeIDOr0(t)
@@ -521,12 +669,75 @@ func resolveExitProtocol(t model.Tunnel, ext *model.ExitNodeExternal, ssMap map[
 		}
 	case "anytls":
 		if a, ok := anyTLSMap[outID]; ok {
-			return "anytls", "", a.Password, map[string]interface{}{}
+			params := map[string]interface{}{}
+			params = applyAnyTLSVerifyDefaults(params, getAnyTLSCertDomain(outID))
+			return "anytls", "", a.Password, params
 		}
 	default:
 		return preferred, "", "", map[string]interface{}{}
 	}
 	return "", "", "", map[string]interface{}{}
+}
+
+func applyAnyTLSVerifyDefaults(params map[string]interface{}, certDomain string) map[string]interface{} {
+	if params == nil {
+		params = map[string]interface{}{}
+	}
+	enabled := isAnyTLSCertFeatureEnabled()
+	certDomain = strings.TrimSpace(certDomain)
+	// Canonicalize verify flags: keep only hyphen style key for downstream outputs.
+	delete(params, "skip_cert_verify")
+	delete(params, "allow-insecure")
+	delete(params, "allow_insecure")
+	delete(params, "insecure")
+	if enabled {
+		params["skip-cert-verify"] = false
+		if certDomain != "" {
+			params["sni"] = certDomain
+		} else if strings.TrimSpace(paramString(params, "sni")) == "" {
+			params["sni"] = defaultAnyTLSSNI
+		}
+	} else {
+		params["skip-cert-verify"] = true
+		delete(params, "sni")
+		delete(params, "server_name")
+		delete(params, "ca-cert-path")
+		delete(params, "ca_cert_path")
+		delete(params, "ca-cert")
+		delete(params, "ca_cert")
+	}
+	return params
+}
+
+func anyTLSSkipCertVerify(params map[string]interface{}) bool {
+	raw := strings.TrimSpace(strings.ToLower(anyTLSParamString(params, "skip-cert-verify")))
+	if raw == "" {
+		return !isAnyTLSCertFeatureEnabled()
+	}
+	switch raw {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return !isAnyTLSCertFeatureEnabled()
+	}
+}
+
+func effectiveAnyTLSSNI(params map[string]interface{}) string {
+	if anyTLSSkipCertVerify(params) {
+		return ""
+	}
+	if params == nil {
+		return defaultAnyTLSSNI
+	}
+	if sni := strings.TrimSpace(paramString(params, "sni")); sni != "" {
+		return sni
+	}
+	if sni := strings.TrimSpace(paramString(params, "server_name")); sni != "" {
+		return sni
+	}
+	return defaultAnyTLSSNI
 }
 
 func isSupportedProtocol(proto string) bool {
@@ -539,6 +750,7 @@ func isSupportedProtocol(proto string) bool {
 }
 
 func uniqueName(base string, id int64, used map[string]int) string {
+	base = strings.TrimSpace(anyTLSLabelMaskRE.ReplaceAllString(base, "edge"))
 	if base == "" {
 		base = fmt.Sprintf("forward-%d", id)
 	}
@@ -548,6 +760,17 @@ func uniqueName(base string, id int64, used map[string]int) string {
 	}
 	used[base]++
 	return fmt.Sprintf("%s-%d", base, used[base])
+}
+
+func normalizeSiteCAPath(path string) string {
+	p := strings.TrimSpace(path)
+	if p == "" {
+		return ""
+	}
+	if strings.EqualFold(p, "/etc/gost/anytls_ca.pem") {
+		return "/etc/gost/docker_site_ca.pem"
+	}
+	return p
 }
 
 func buildSkipStrings(skipped []subSkip) []string {
@@ -682,14 +905,17 @@ func writeClashAnyTLS(buf *bytes.Buffer, it subProxy, params map[string]interfac
 	if pass == "" {
 		pass = paramString(params, "password")
 	}
+	pass = stripUserPrefix(pass)
 	buf.WriteString("    password: " + yamlQuote(pass) + "\n")
 	buf.WriteString("    udp: " + strconv.FormatBool(paramBoolDefault(params, "udp", true)) + "\n")
 	buf.WriteString("    client-fingerprint: " + yamlQuote(paramStringDefault(params, "client-fingerprint", "chrome")) + "\n")
 	buf.WriteString("    idle-session-check-interval: " + strconv.Itoa(paramIntDefault(params, "idle-session-check-interval", 30)) + "\n")
 	buf.WriteString("    idle-session-timeout: " + strconv.Itoa(paramIntDefault(params, "idle-session-timeout", 30)) + "\n")
 	buf.WriteString("    min-idle-session: " + strconv.Itoa(paramIntDefault(params, "min-idle-session", 0)) + "\n")
-	buf.WriteString("    sni: " + yamlQuote(paramStringDefault(params, "sni", "www.apple.com")) + "\n")
-	buf.WriteString("    skip-cert-verify: " + strconv.FormatBool(paramBoolDefault(params, "skip-cert-verify", true)) + "\n")
+	if sni := effectiveAnyTLSSNI(params); sni != "" {
+		buf.WriteString("    sni: " + yamlQuote(sni) + "\n")
+	}
+	buf.WriteString("    skip-cert-verify: " + strconv.FormatBool(anyTLSSkipCertVerify(params)) + "\n")
 }
 
 func buildClashConfigLegacy(items []subProxy, skipped []subSkip) string {
@@ -775,6 +1001,10 @@ func buildClashConfigLegacy(items []subProxy, skipped []subSkip) string {
 			skip["min-idle-session"] = struct{}{}
 			skip["sni"] = struct{}{}
 			skip["skip-cert-verify"] = struct{}{}
+			skip["skip_cert_verify"] = struct{}{}
+			skip["allow-insecure"] = struct{}{}
+			skip["allow_insecure"] = struct{}{}
+			skip["insecure"] = struct{}{}
 		}
 		appendClashParams(&buf, params, skip)
 	}
@@ -830,10 +1060,15 @@ func buildShadowrocket(items []subProxy, skipped []subSkip) string {
 			if pass == "" {
 				pass = paramString(params, "password")
 			}
+			pass = stripUserPrefix(pass)
 			if pass == "" {
 				continue
 			}
-			lines = append(lines, "anytls://"+url.QueryEscape(pass)+"@"+it.Server+":"+strconv.Itoa(it.Port)+"#"+url.QueryEscape(it.Name))
+			uri := buildAnyTLSURI(pass, it, params)
+			if uri == "" {
+				continue
+			}
+			lines = append(lines, uri)
 		case "socks5":
 			lines = append(lines, "socks5://"+it.Server+":"+strconv.Itoa(it.Port)+"#"+url.QueryEscape(it.Name))
 		case "http", "https":
@@ -959,11 +1194,11 @@ func buildSurgeConfigLegacy(items []subProxy, skipped []subSkip, ver string, sou
 			if pass == "" {
 				continue
 			}
-			buf.WriteString(fmt.Sprintf("%s = anytls, %s, %d, password=%s, tfo=true, skip-cert-verify=true\n", it.Name, it.Server, it.Port, pass))
+			buf.WriteString(buildSurgeAnyTLSLine(it.Name, it.Server, it.Port, pass, params))
 		case "socks5":
 			buf.WriteString(fmt.Sprintf("%s = socks5, %s, %d\n", it.Name, it.Server, it.Port))
 		case "http", "https":
-			buf.WriteString(fmt.Sprintf("%s = %s, %s, %d\n", it.Name, it.Server, it.Port))
+			buf.WriteString(fmt.Sprintf("%s = %s, %s, %d\n", it.Name, typ, it.Server, it.Port))
 		default:
 			line := buildSurgeGenericLine(typ, it, params)
 			if line != "" {
@@ -1062,6 +1297,10 @@ func renderClashProxies(items []subProxy) (string, map[string][]string) {
 			skip["min-idle-session"] = struct{}{}
 			skip["sni"] = struct{}{}
 			skip["skip-cert-verify"] = struct{}{}
+			skip["skip_cert_verify"] = struct{}{}
+			skip["allow-insecure"] = struct{}{}
+			skip["allow_insecure"] = struct{}{}
+			skip["insecure"] = struct{}{}
 		}
 		appendClashParams(&buf, params, skip)
 		for _, g := range splitGroupNames(it.Group) {
@@ -1222,7 +1461,7 @@ func renderSurgeProxies(items []subProxy) (string, map[string][]string) {
 				if pass == "" {
 					continue
 				}
-				line = fmt.Sprintf("%s = anytls, %s, %d, password=%s, tfo=true, skip-cert-verify=true\n", it.Name, it.Server, it.Port, pass)
+				line = buildSurgeAnyTLSLine(it.Name, it.Server, it.Port, pass, params)
 			case "socks5":
 				line = fmt.Sprintf("%s = socks5, %s, %d\n", it.Name, it.Server, it.Port)
 			case "http", "https":
@@ -1411,6 +1650,34 @@ func stripUserPrefix(pass string) string {
 		return m[1]
 	}
 	return pass
+}
+
+func normalizeEgressIP(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	s = strings.Trim(s, `"'`)
+	if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
+		s = strings.TrimPrefix(strings.TrimSuffix(s, "]"), "[")
+	}
+	if host, _, err := net.SplitHostPort(s); err == nil {
+		s = host
+	}
+	if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
+		s = strings.TrimPrefix(strings.TrimSuffix(s, "]"), "[")
+	}
+	if i := strings.IndexByte(s, '/'); i > 0 {
+		s = s[:i]
+	}
+	if i := strings.IndexByte(s, '%'); i > 0 {
+		s = s[:i]
+	}
+	ip := net.ParseIP(s)
+	if ip == nil {
+		return ""
+	}
+	return ip.String()
 }
 
 func splitGroupList(raw string) []string {
@@ -1834,6 +2101,32 @@ func paramString(params map[string]interface{}, key string) string {
 	return ""
 }
 
+func paramStringFirst(params map[string]interface{}, keys ...string) string {
+	for _, key := range keys {
+		if v := paramString(params, key); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func anyTLSParamString(params map[string]interface{}, key string) string {
+	switch strings.TrimSpace(key) {
+	case "egress-ip":
+		return paramStringFirst(params, "egress-ip", "egress_ip")
+	case "egress-rule":
+		return paramStringFirst(params, "egress-rule", "egress_rule")
+	case "ca-cert-path":
+		return paramStringFirst(params, "ca-cert-path", "ca_cert_path", "ca-cert", "ca_cert")
+	case "skip-cert-verify":
+		return paramStringFirst(params, "skip-cert-verify", "skip_cert_verify", "insecure", "allow-insecure", "allow_insecure")
+	case "allow-insecure":
+		return paramStringFirst(params, "allow-insecure", "allow_insecure", "insecure", "skip-cert-verify", "skip_cert_verify")
+	default:
+		return paramString(params, key)
+	}
+}
+
 func requiredParamsReady(proto string, it subProxy, params map[string]interface{}) bool {
 	switch normalizeProtocol(proto) {
 	case "ss":
@@ -2000,8 +2293,15 @@ func buildSurgeGenericLine(typ string, it subProxy, params map[string]interface{
 	if u := paramString(params, "cipher"); u != "" {
 		appendParam("encrypt-method", u)
 	}
-	if u := paramString(params, "sni"); u != "" {
+	if typ == "anytls" {
+		if u := effectiveAnyTLSSNI(params); u != "" {
+			appendParam("sni", u)
+		}
+	} else if u := paramString(params, "sni"); u != "" {
 		appendParam("sni", u)
+	}
+	if u := normalizeEgressIP(anyTLSParamString(params, "egress-ip")); u != "" {
+		appendParam("egress-ip", u)
 	}
 	if u := paramString(params, "alpn"); u != "" {
 		appendParam("alpn", u)
@@ -2012,8 +2312,14 @@ func buildSurgeGenericLine(typ string, it subProxy, params map[string]interface{
 	if u := paramString(params, "tls"); u != "" {
 		appendParam("tls", u)
 	}
-	if u := paramString(params, "skip-cert-verify"); u != "" {
-		appendParam("skip-cert-verify", u)
+	if u := anyTLSParamString(params, "skip-cert-verify"); u != "" {
+		if typ == "anytls" {
+			appendParam("skip-cert-verify", strconv.FormatBool(anyTLSSkipCertVerify(params)))
+		} else {
+			appendParam("skip-cert-verify", u)
+		}
+	} else if typ == "anytls" {
+		appendParam("skip-cert-verify", strconv.FormatBool(anyTLSSkipCertVerify(params)))
 	}
 	if ws, ok := params["ws-opts"].(map[string]interface{}); ok {
 		appendParam("ws", "true")
@@ -2031,6 +2337,26 @@ func buildSurgeGenericLine(typ string, it subProxy, params map[string]interface{
 		if svc, ok := grpc["grpc-service-name"]; ok {
 			appendParam("grpc-service-name", paramString(map[string]interface{}{"v": svc}, "v"))
 		}
+	}
+	return strings.Join(parts, ", ") + "\n"
+}
+
+func buildSurgeAnyTLSLine(name, server string, port int, pass string, params map[string]interface{}) string {
+	pass = stripUserPrefix(pass)
+	if pass == "" {
+		return ""
+	}
+	parts := []string{
+		fmt.Sprintf("%s = anytls, %s, %d", name, server, port),
+		"password=" + pass,
+		"tfo=true",
+		"skip-cert-verify=" + strconv.FormatBool(anyTLSSkipCertVerify(params)),
+	}
+	if sni := effectiveAnyTLSSNI(params); sni != "" {
+		parts = append(parts, "sni="+sni)
+	}
+	if egressIP := normalizeEgressIP(anyTLSParamString(params, "egress-ip")); egressIP != "" {
+		parts = append(parts, "egress-ip="+egressIP)
 	}
 	return strings.Join(parts, ", ") + "\n"
 }
@@ -2233,21 +2559,12 @@ func buildSingboxOutbound(typ string, it subProxy, params map[string]interface{}
 		if pass == "" {
 			pass = paramString(params, "password")
 		}
+		pass = stripUserPrefix(pass)
 		if pass == "" {
 			return map[string]interface{}{}
 		}
 		base["type"] = "anytls"
 		base["password"] = pass
-		sni := paramString(params, "sni")
-		if sni == "" {
-			sni = "www.apple.com"
-		}
-		insecure := paramBool(params, "skip-cert-verify") || paramBool(params, "insecure")
-		base["tls"] = map[string]interface{}{
-			"enabled":     true,
-			"server_name": sni,
-			"insecure":    insecure,
-		}
 	case "vmess":
 		base["type"] = "vmess"
 		base["uuid"] = paramString(params, "uuid")
@@ -2365,28 +2682,30 @@ func buildSingboxOutbound(typ string, it subProxy, params map[string]interface{}
 		needTLS = true
 	}
 	if needTLS {
+		isAnyTLS := normalizeProtocol(typ) == "anytls"
+		anyTLSSkip := isAnyTLS && anyTLSSkipCertVerify(params)
 		tlsCfg := map[string]interface{}{
 			"enabled": true,
 		}
-		if sni := paramString(params, "sni"); sni != "" {
+		if sni := paramString(params, "sni"); sni != "" && !anyTLSSkip {
 			tlsCfg["server_name"] = sni
-		} else if host := it.Server; host != "" {
+		} else if host := it.Server; host != "" && !anyTLSSkip {
 			if net.ParseIP(host) == nil {
 				tlsCfg["server_name"] = host
 			}
 		}
-		if normalizeProtocol(typ) == "anytls" {
-			if _, ok := tlsCfg["server_name"]; !ok {
-				tlsCfg["server_name"] = "www.apple.com"
+		if isAnyTLS {
+			if _, ok := tlsCfg["server_name"]; !ok && !anyTLSSkip {
+				if sni := effectiveAnyTLSSNI(params); sni != "" {
+					tlsCfg["server_name"] = sni
+				}
 			}
-			if _, ok := tlsCfg["insecure"]; !ok {
-				tlsCfg["insecure"] = true
-			}
+			tlsCfg["insecure"] = anyTLSSkip
 		}
 		if alpn := paramString(params, "alpn"); alpn != "" {
 			tlsCfg["alpn"] = strings.Split(alpn, ",")
 		}
-		if paramBool(params, "skip-cert-verify") {
+		if paramBool(params, "skip-cert-verify") && normalizeProtocol(typ) != "anytls" {
 			tlsCfg["insecure"] = true
 		}
 		if real, ok := params["reality-opts"].(map[string]interface{}); ok {
@@ -2610,13 +2929,41 @@ func buildV2rayURI(typ string, it subProxy, params map[string]interface{}) strin
 		if pass == "" {
 			pass = paramString(params, "password")
 		}
+		pass = stripUserPrefix(pass)
 		if pass == "" {
 			return ""
 		}
-		return fmt.Sprintf("anytls://%s@%s:%d#%s", url.QueryEscape(pass), it.Server, it.Port, url.QueryEscape(it.Name))
+		return buildAnyTLSURI(pass, it, params)
 	default:
 		return ""
 	}
+}
+
+func buildAnyTLSURI(pass string, it subProxy, params map[string]interface{}) string {
+	pass = stripUserPrefix(pass)
+	if pass == "" {
+		return ""
+	}
+	base := fmt.Sprintf("anytls://%s@%s:%d", url.QueryEscape(pass), it.Server, it.Port)
+	parts := make([]string, 0, 4)
+	if sni := effectiveAnyTLSSNI(params); sni != "" {
+		parts = append(parts, "sni="+url.QueryEscape(sni))
+	}
+	if egressIP := normalizeEgressIP(anyTLSParamString(params, "egress-ip")); egressIP != "" {
+		parts = append(parts, "egress-ip="+url.QueryEscape(egressIP))
+	}
+	if caPath := normalizeSiteCAPath(anyTLSParamString(params, "ca-cert-path")); caPath != "" {
+		parts = append(parts, "ca-cert-path="+url.QueryEscape(caPath))
+	}
+	if anyTLSSkipCertVerify(params) {
+		parts = append(parts, "insecure=1")
+	} else {
+		parts = append(parts, "insecure=0")
+	}
+	if len(parts) > 0 {
+		base += "/?" + strings.Join(parts, "&")
+	}
+	return base + "#" + url.QueryEscape(it.Name)
 }
 
 func buildQXLine(typ string, it subProxy, params map[string]interface{}) string {
@@ -2754,10 +3101,22 @@ func buildQXLine(typ string, it subProxy, params map[string]interface{}) string 
 		if pass == "" {
 			pass = paramString(params, "password")
 		}
+		pass = stripUserPrefix(pass)
 		if pass == "" {
 			return ""
 		}
-		return fmt.Sprintf("anytls=%s:%d,password=%s,tag=%s", it.Server, it.Port, pass, it.Name)
+		parts := []string{
+			fmt.Sprintf("anytls=%s:%d", it.Server, it.Port),
+			"password=" + pass,
+			"tag=" + it.Name,
+		}
+		if sni := effectiveAnyTLSSNI(params); sni != "" {
+			parts = append(parts, "sni="+sni)
+		}
+		if egressIP := normalizeEgressIP(anyTLSParamString(params, "egress-ip")); egressIP != "" {
+			parts = append(parts, "egress-ip="+egressIP)
+		}
+		return strings.Join(parts, ",")
 	case "http", "https":
 		return fmt.Sprintf("%s=%s:%d,tag=%s", typ, it.Server, it.Port, it.Name)
 	case "socks5":

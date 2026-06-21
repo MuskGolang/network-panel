@@ -232,6 +232,37 @@ go-gost/gost.json
 *.tmp
 *.temp
 .cache/
+.tmp/
+tmp/
+tmp-*/
+*.trace
+*.pprof
+*.prof
+*.cpuprofile
+*.memprofile
+*.heap
+*.dump
+
+# 本地构建/调试中间产物（不提交）
+.gocache_local/
+.gocache_test/
+.gomodcache/
+.gopath/
+.release/
+.release-static/
+dist/releases/
+flux-agent
+flux-agent2
+server
+network-panel-server
+
+# 本地临时脚本（不提交）
+scripts/deploy_*.sh
+scripts/upload_static_to_server.sh
+scripts/*_local.sh
+scripts/local/
+scripts/tmp/
+*.local.sh
 
 
 gitee/
@@ -266,3 +297,4 @@ publish_beta.sh
 scripts/upload_static_to_server.sh
 .release-static
 .release
+./scripts/deploy_flux_agent_via_jump.sh

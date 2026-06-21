@@ -3,6 +3,7 @@ package db
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"time"
 
 	"network-panel/golang-backend/internal/app/model"
@@ -102,6 +103,7 @@ func Init() error {
 		&model.StatisticsFlow{},
 		&model.ExitSetting{},
 		&model.AnyTLSSetting{},
+		&model.AnyTLSPortEgress{},
 		&model.ExitNodeExternal{},
 		&model.ProbeTarget{},
 		&model.NodeProbeResult{},
@@ -110,6 +112,7 @@ func Init() error {
 		&model.NodeSysInfo{},
 		&model.NodeRuntime{},
 		&model.NodeOpLog{},
+		&model.NodeAnyTLSCertLog{},
 		&model.ForwardMidPort{},
 		&model.HeartbeatRecord{},
 		&model.FlowTimeseries{},
@@ -120,10 +123,88 @@ func Init() error {
 		return err
 	}
 	// Seed admin user
+	if err := cleanupAutoFilledTunnelOutIP(); err != nil {
+		return err
+	}
+	if err := resetAllTunnelOutIP(); err != nil {
+		return err
+	}
 	if err := seedAdmin(); err != nil {
 		return err
 	}
 	return nil
+}
+
+func cleanupAutoFilledTunnelOutIP() error {
+	const marker = "migration_clear_auto_tunnel_out_ip_v1"
+	var existed int64
+	if err := DB.Model(&model.ViteConfig{}).Where("name = ?", marker).Count(&existed).Error; err != nil {
+		return err
+	}
+	if existed > 0 {
+		return nil
+	}
+
+	var res *gorm.DB
+	if os.Getenv("DB_DIALECT") == "sqlite" {
+		res = DB.Exec(`
+UPDATE tunnel
+SET out_ip = NULL
+WHERE out_node_id IS NOT NULL
+  AND (out_exit_id IS NULL OR out_exit_id = 0)
+  AND COALESCE(out_ip, '') <> ''
+  AND out_ip = (SELECT server_ip FROM node WHERE node.id = tunnel.out_node_id)
+`)
+	} else {
+		res = DB.Exec(`
+UPDATE tunnel t
+JOIN node n ON n.id = t.out_node_id
+SET t.out_ip = NULL
+WHERE t.out_node_id IS NOT NULL
+  AND (t.out_exit_id IS NULL OR t.out_exit_id = 0)
+  AND IFNULL(t.out_ip, '') <> ''
+  AND t.out_ip = n.server_ip
+`)
+	}
+	if res.Error != nil {
+		return res.Error
+	}
+
+	now := time.Now().UnixMilli()
+	v := model.ViteConfig{
+		Name:  marker,
+		Value: strconv.FormatInt(res.RowsAffected, 10),
+		Time:  now,
+	}
+	return DB.Create(&v).Error
+}
+
+func resetAllTunnelOutIP() error {
+	const marker = "migration_reset_all_tunnel_out_ip_v2"
+	var existed int64
+	if err := DB.Model(&model.ViteConfig{}).Where("name = ?", marker).Count(&existed).Error; err != nil {
+		return err
+	}
+	if existed > 0 {
+		return nil
+	}
+
+	res := DB.Exec(`
+UPDATE tunnel
+SET out_ip = NULL
+WHERE COALESCE(out_ip, '') <> ''
+`)
+	if res.Error != nil {
+		return res.Error
+	}
+
+	now := time.Now().UnixMilli()
+	v := model.ViteConfig{
+		Name:  marker,
+		Value: strconv.FormatInt(res.RowsAffected, 10),
+		Time:  now,
+	}
+	return DB.Create(&v).Error
 }
 
 func seedAdmin() error {

@@ -152,6 +152,8 @@ func performUpgrade(proxyPrefix string, logf func(string, ...any)) (map[string]a
 			errs = append(errs, msg)
 			logf(msg)
 		} else {
+			// Prevent stale precompressed sidecar files from being picked by proxies.
+			cleanCompressedAssets(filepath.Join("public", "assets"))
 			logf("frontend-dist.zip 下载完成，开始解压到 public/")
 			if err := unzipTo(file, "public"); err != nil {
 				msg := fmt.Sprintf("frontend-dist.zip 解压失败: %v", err)
@@ -603,6 +605,22 @@ func unzipTo(zipPath, destDir string) error {
 		}
 	}
 	return nil
+}
+
+func cleanCompressedAssets(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := strings.ToLower(e.Name())
+		if strings.HasSuffix(name, ".gz") || strings.HasSuffix(name, ".br") {
+			_ = os.Remove(filepath.Join(dir, e.Name()))
+		}
+	}
 }
 
 // pick server asset URL for current linux architecture

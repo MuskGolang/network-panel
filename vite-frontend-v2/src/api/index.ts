@@ -44,10 +44,12 @@ export const checkNodeStatus = (nodeId?: number) => {
 export const setExitNode = (data: {
   nodeId: number;
   type?: string;
-  port: number;
-  password: string;
+  port?: number;
+  anytlsPorts?: Array<{ port: number; exitIp?: string }>;
+  password?: string;
   exitIp?: string;
   allowFallback?: boolean;
+  certDomain?: string;
   method?: string;
   observer?: string;
   limiter?: string;
@@ -57,6 +59,12 @@ export const setExitNode = (data: {
 // 获取节点上次保存的出口设置
 export const getExitNode = (nodeId: number, type?: string) =>
   Network.post("/node/get-exit", type ? { nodeId, type } : { nodeId });
+export const getAnyTLSCertPreview = (nodeId: number) =>
+  Network.post("/node/docker-cert-preview", { nodeId });
+export const checkAnyTLSCertChain = (nodeId: number) =>
+  Network.post("/node/docker-cert-chain-check", { nodeId });
+export const reissueAnyTLSCert = (nodeId: number, certDomain?: string) =>
+  Network.post("/node/docker-cert-reissue", certDomain ? { nodeId, certDomain } : { nodeId });
 // 查询节点上的服务
 export const queryNodeServices = (data: { nodeId: number; filter?: string }) =>
   Network.post("/node/query-services", data);
@@ -145,6 +153,20 @@ export const listNodeOps = (params: {
   limit?: number;
   requestId?: string;
 }) => Network.post("/node/ops", params);
+export const listNodeAnyTLSCertLogs = (params: {
+  nodeId: number;
+  limit?: number;
+}) => Network.post("/node/docker-cert-logs", params);
+export const listNodeAnyTLSRuntimeLogs = (params: {
+  nodeId: number;
+  limit?: number;
+  windowSec?: number;
+}) => Network.post("/node/docker-runtime-logs", params);
+export const upgradeNodeAgentsBatch = (nodeIds?: number[]) =>
+  Network.post(
+    "/node/agent-upgrade-batch",
+    nodeIds && nodeIds.length > 0 ? { nodeIds } : {},
+  );
 
 // 用户隧道权限管理操作 - 全部使用POST请求
 export const assignUserTunnel = (data: any) =>
@@ -197,8 +219,11 @@ export const singboxTestForward = (forwardId: number, nodeId: number, mode: stri
   Network.post("/forward/singbox-test", { forwardId, nodeId, mode });
 export const restartGost = (nodeId: number) =>
   Network.post("/node/restart-gost", { nodeId });
-export const enableGostApi = (nodeId: number) =>
-  Network.post("/node/enable-gost-api", { nodeId });
+export const enableGostApi = (nodeId: number, port?: number) =>
+  Network.post("/node/enable-gost-api", {
+    nodeId,
+    ...(typeof port === "number" && port > 0 ? { port } : {}),
+  });
 
 // 出口节点（含外部）
 export const getExitNodes = () => Network.post("/exit/list");
@@ -263,6 +288,55 @@ export const updateConfigs = (configMap: Record<string, string>) =>
 export const updateConfig = (name: string, value: string) =>
   Network.post("/config/update-single", { name, value });
 
+// AnyTLS CA 管理（管理员）
+export interface AnyTLSCAStatus {
+  certDir: string;
+  caCertPath: string;
+  caKeyPath: string;
+  caExists: boolean;
+  keyExists: boolean;
+  caUpdatedAtMs?: number;
+  keyUpdatedAtMs?: number;
+  notBeforeMs?: number;
+  notAfterMs?: number;
+  daysRemaining?: number;
+  refreshAtMs?: number;
+  serialNumber?: string;
+  subject?: string;
+  issuer?: string;
+  subjectCommonName?: string;
+  subjectOrganization?: string;
+  parseError?: string;
+  rotated?: boolean;
+  certCommonName?: string;
+  certOrganization?: string;
+  domainSuffix?: string;
+  randomPrefixLength?: number;
+  domainFormatExample?: string;
+  nodeCertValidityMs?: number;
+  agentRefreshHours?: number;
+}
+export interface AnyTLSCACheckResult {
+  pemFirstLine?: string;
+  pemHeaderOK?: boolean;
+  parseOK?: boolean;
+  downloadReady?: boolean;
+  error?: string;
+  publicKeyAlgorithm?: string;
+  signatureAlgorithm?: string;
+  subjectCommonName?: string;
+  subjectOrganization?: string;
+  notBeforeMs?: number;
+  notAfterMs?: number;
+  isCA?: boolean;
+}
+export const getAnyTLSCAStatus = () =>
+  Network.get<AnyTLSCAStatus>("/subscription/docker-ca/status");
+export const generateAnyTLSCA = (force: boolean = true) =>
+  Network.post<AnyTLSCAStatus>("/subscription/docker-ca/generate", { force });
+export const getAnyTLSCACheck = () =>
+  Network.get<AnyTLSCACheckResult>("/subscription/docker-ca/check");
+
 // 验证码相关接口
 export const checkCaptcha = () => Network.post("/captcha/check");
 export const generateCaptcha = () => Network.post(`/captcha/generate`);
@@ -284,6 +358,16 @@ export const nodeDiagResult = (
 ) => Network.post("/node/diag/result", { nodeId, kind, requestId });
 export const nodeIperf3Status = (nodeId: number) =>
   Network.post("/node/diag/iperf3-status", { nodeId });
+export const nodePprofControl = (
+  nodeId: number,
+  action: "enable" | "disable" | "status",
+  addr?: string,
+) => Network.post("/node/pprof/control", { nodeId, action, addr });
+export const nodePprofFetch = (
+  nodeId: number,
+  profile: "goroutine" | "heap" | "mutex" | "block" | "threadcreate",
+  debug: number = 1,
+) => Network.post("/node/pprof/fetch", { nodeId, profile, debug });
 
 // 探针目标管理（管理员）
 export const listProbeTargets = () => Network.post("/probe/list");

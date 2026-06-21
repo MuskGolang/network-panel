@@ -175,6 +175,16 @@ func ForwardCreate(c *gin.Context) {
 		InterfaceName: req.InterfaceName,
 		Strategy:      req.Strategy,
 	}
+	if req.Egresses != nil {
+		items := make([]forwardEgressItem, 0, len(*req.Egresses))
+		for _, eg := range *req.Egresses {
+			items = append(items, forwardEgressItem{
+				IP:     strings.TrimSpace(eg.IP),
+				Suffix: strings.TrimSpace(eg.Suffix),
+			})
+		}
+		f.EgressesRaw = encodeForwardEgressItems(items)
+	}
 	// allocate outPort for tunnel-forward
 	if tun.Type == 2 {
 		if !isExternalExit(tun) && tun.OutNodeID == nil {
@@ -216,6 +226,10 @@ func ForwardCreate(c *gin.Context) {
 			c.JSON(http.StatusOK, response.ErrMsg("隧道出口端口已满，无法分配新端口"))
 			return
 		}
+	}
+	if err := prepareForwardAnyTLSInstance(&tun, &f, req.OutPort); err != nil {
+		c.JSON(http.StatusOK, response.ErrMsg(err.Error()))
+		return
 	}
 	if err := dbpkg.DB.Create(&f).Error; err != nil {
 		c.JSON(http.StatusOK, response.ErrMsg("端口转发创建失败"))
@@ -711,13 +725,14 @@ func ForwardList(c *gin.Context) {
 	uidInf, _ := c.Get("user_id")
 	var res []struct {
 		model.Forward
-		TunnelName string `json:"tunnelName"`
-		InIp       string `json:"inIp"`
-		InNodeID   int64  `json:"inNodeId"`
-		TType      int    `json:"tType"`
-		OutNodeID  *int64 `json:"outNodeId,omitempty"`
-		OutExitID  *int64 `json:"outExitId,omitempty"`
-		Protocol   *string `json:"protocol,omitempty"`
+		TunnelName string              `json:"tunnelName"`
+		InIp       string              `json:"inIp"`
+		InNodeID   int64               `json:"inNodeId"`
+		TType      int                 `json:"tType"`
+		OutNodeID  *int64              `json:"outNodeId,omitempty"`
+		OutExitID  *int64              `json:"outExitId,omitempty"`
+		Protocol   *string             `json:"protocol,omitempty"`
+		Egresses   []forwardEgressItem `json:"egresses,omitempty" gorm:"-"`
 	}
 	q := dbpkg.DB.Table("forward f").
 		Select("f.*, t.name as tunnel_name, t.in_ip as in_ip, t.in_node_id, t.out_node_id, t.out_exit_id, t.type as t_type, t.protocol").
@@ -783,6 +798,9 @@ func ForwardList(c *gin.Context) {
 				}
 			}
 		}
+	}
+	for i := range res {
+		res[i].Egresses = parseForwardEgressItems(res[i].Forward.EgressesRaw)
 	}
 	c.JSON(http.StatusOK, response.Ok(res))
 }
@@ -865,6 +883,20 @@ func ForwardUpdate(c *gin.Context) {
 	}
 	if req.RemoteAddr != "" {
 		f.RemoteAddr = normalizeRemoteAddrList(req.RemoteAddr)
+	}
+	if req.Egresses != nil {
+		items := make([]forwardEgressItem, 0, len(*req.Egresses))
+		for _, eg := range *req.Egresses {
+			items = append(items, forwardEgressItem{
+				IP:     strings.TrimSpace(eg.IP),
+				Suffix: strings.TrimSpace(eg.Suffix),
+			})
+		}
+		f.EgressesRaw = encodeForwardEgressItems(items)
+	}
+	if err := prepareForwardAnyTLSInstance(&tun, &f, req.OutPort); err != nil {
+		c.JSON(http.StatusOK, response.ErrMsg(err.Error()))
+		return
 	}
 	f.InterfaceName, f.Strategy = req.InterfaceName, req.Strategy
 	f.UpdatedTime = time.Now().UnixMilli()
@@ -985,10 +1017,9 @@ func ForwardUpdate(c *gin.Context) {
 				"handler":  relayHandler(auth),
 				"metadata": map[string]any{"managedBy": "network-panel", "enableStats": true, "observer.period": "5s", "observer.resetTraffic": false},
 			}
-			_ = sendWSCommand(outNodeIDOr0(tun), "AddService", expandRUDP([]map[string]any{outSvc}))
-			if b, err := json.Marshal(outSvc); err == nil {
-				s := string(b)
-				_ = dbpkg.DB.Create(&model.NodeOpLog{TimeMs: time.Now().UnixMilli(), NodeID: outNodeIDOr0(tun), Cmd: "ForwardAddService", RequestID: opId, Success: 1, Message: "update out svc", Stdout: &s}).Error
+			if err := applyAddServiceWithResult(outNodeIDOr0(tun), outSvc, opId, "update out svc"); err != nil {
+				c.JSON(http.StatusOK, response.ErrMsg(err.Error()))
+				return
 			}
 		}
 
@@ -1136,10 +1167,9 @@ func ForwardUpdate(c *gin.Context) {
 				if iface != nil && *iface != "" {
 					svc["metadata"].(map[string]any)["interface"] = *iface
 				}
-				_ = sendWSCommand(nid, "AddService", expandRUDP([]map[string]any{svc}))
-				if b, err := json.Marshal(svc); err == nil {
-					s := string(b)
-					_ = dbpkg.DB.Create(&model.NodeOpLog{TimeMs: time.Now().UnixMilli(), NodeID: nid, Cmd: "ForwardAddService", RequestID: opId, Success: 1, Message: fmt.Sprintf("update mid svc %s port=%d", midName, thisPort), Stdout: &s}).Error
+				if err := applyAddServiceWithResult(nid, svc, opId, fmt.Sprintf("update mid svc %s port=%d", midName, thisPort)); err != nil {
+					c.JSON(http.StatusOK, response.ErrMsg(err.Error()))
+					return
 				}
 			}
 			// compute entry target to first mid
@@ -1188,10 +1218,9 @@ func ForwardUpdate(c *gin.Context) {
 		}
 		node := map[string]any{"name": "node-" + name, "addr": entryTarget, "connector": relayConnector(auth), "dialer": map[string]any{"type": "grpc"}}
 		inSvc["_chains"] = []any{map[string]any{"name": chainName, "hops": []any{map[string]any{"name": hopName, "nodes": []any{node}}}}}
-		_ = sendWSCommand(tun.InNodeID, "AddService", expandRUDP([]map[string]any{inSvc}))
-		if b, err := json.Marshal(inSvc); err == nil {
-			s := string(b)
-			_ = dbpkg.DB.Create(&model.NodeOpLog{TimeMs: time.Now().UnixMilli(), NodeID: tun.InNodeID, Cmd: "ForwardUpdateService", RequestID: opId, Success: 1, Message: "update entry svc", Stdout: &s}).Error
+		if err := applyAddServiceWithResult(tun.InNodeID, inSvc, opId, "update entry svc"); err != nil {
+			c.JSON(http.StatusOK, response.ErrMsg(err.Error()))
+			return
 		}
 		// 强制重启入口与出口节点的 gost，确保更新立即生效
 		// 不重启，配置已生效
@@ -1246,7 +1275,10 @@ func ForwardUpdate(c *gin.Context) {
 					relayPort = minP
 				}
 				relaySvc := buildRelayService(fmt.Sprintf("%s_relay_%d", name, outID), relayPort, auth)
-				_ = sendWSCommand(outID, "AddService", expandRUDP([]map[string]any{relaySvc}))
+				if err := applyAddServiceWithResult(outID, relaySvc, opId, fmt.Sprintf("update relay svc node=%d port=%d", outID, relayPort)); err != nil {
+					c.JSON(http.StatusOK, response.ErrMsg(err.Error()))
+					return
+				}
 				relayHost := ""
 				if v, ok := bindMap[outID]; ok && v != "" {
 					relayHost = v
@@ -1258,10 +1290,9 @@ func ForwardUpdate(c *gin.Context) {
 				}
 				attachRelayChainToService(svc, fmt.Sprintf("chain_%s_0", name), safeHostPort(relayHost, relayPort), auth)
 			}
-			_ = sendWSCommand(tun.InNodeID, "AddService", expandRUDP([]map[string]any{svc}))
-			if b, err := json.Marshal(svc); err == nil {
-				s := string(b)
-				_ = dbpkg.DB.Create(&model.NodeOpLog{TimeMs: time.Now().UnixMilli(), NodeID: tun.InNodeID, Cmd: "ForwardUpdateService", RequestID: opId, Success: 1, Message: "update entry svc (type1-single)", Stdout: &s}).Error
+			if err := applyAddServiceWithResult(tun.InNodeID, svc, opId, "update entry svc (type1-single)"); err != nil {
+				c.JSON(http.StatusOK, response.ErrMsg(err.Error()))
+				return
 			}
 			// 不重启
 		} else {
@@ -1346,7 +1377,10 @@ func ForwardUpdate(c *gin.Context) {
 				}
 				relayPorts[relayNodeID] = relayPort
 				relaySvc := buildRelayService(fmt.Sprintf("%s_relay_%d", name, relayNodeID), relayPort, auth)
-				_ = sendWSCommand(relayNodeID, "AddService", expandRUDP([]map[string]any{relaySvc}))
+				if err := applyAddServiceWithResult(relayNodeID, relaySvc, opId, fmt.Sprintf("update relay svc node=%d port=%d", relayNodeID, relayPort)); err != nil {
+					c.JSON(http.StatusOK, response.ErrMsg(err.Error()))
+					return
+				}
 			}
 
 			for i := 0; i < len(hops); i++ {
@@ -1407,10 +1441,9 @@ func ForwardUpdate(c *gin.Context) {
 						attachRelayChainToService(svc, fmt.Sprintf("chain_%s_%d", name, i), safeHostPort(relayHost, relayPort), auth)
 					}
 				}
-				_ = sendWSCommand(nodeID, "AddService", expandRUDP([]map[string]any{svc}))
-				if b, err := json.Marshal(svc); err == nil {
-					s := string(b)
-					_ = dbpkg.DB.Create(&model.NodeOpLog{TimeMs: time.Now().UnixMilli(), NodeID: nodeID, Cmd: "ForwardAddService", RequestID: opId, Success: 1, Message: fmt.Sprintf("update hop svc port=%d", listenPort), Stdout: &s}).Error
+				if err := applyAddServiceWithResult(nodeID, svc, opId, fmt.Sprintf("update hop svc port=%d", listenPort)); err != nil {
+					c.JSON(http.StatusOK, response.ErrMsg(err.Error()))
+					return
 				}
 			}
 		}
@@ -1561,6 +1594,7 @@ func deleteForwardByID(id int64) error {
 	}
 	// cleanup expected mid ports
 	_ = dbpkg.DB.Where("forward_id = ?", id).Delete(&model.ForwardMidPort{}).Error
+	cleanupForwardAnyTLSInstance(tun, f)
 	if err := dbpkg.DB.Delete(&model.Forward{}, id).Error; err != nil {
 		return fmt.Errorf("端口转发删除失败")
 	}
@@ -2377,12 +2411,20 @@ func getTunnelPathNodes(tunnelID int64) []int64 {
 	if err := dbpkg.DB.Where("name = ?", key).First(&cfg).Error; err != nil || cfg.Value == "" {
 		return nil
 	}
+	return parseTunnelPathNodesValue(cfg.Value)
+}
+
+func parseTunnelPathNodesValue(value string) []int64 {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
 	var ids []int64
-	if e := json.Unmarshal([]byte(cfg.Value), &ids); e == nil {
+	if e := json.Unmarshal([]byte(value), &ids); e == nil {
 		return ids
 	}
 	// also support comma separated values
-	parts := strings.Split(cfg.Value, ",")
+	parts := strings.Split(value, ",")
 	for _, p := range parts {
 		p = strings.TrimSpace(p)
 		if p == "" {
@@ -2393,6 +2435,41 @@ func getTunnelPathNodes(tunnelID int64) []int64 {
 		}
 	}
 	return ids
+}
+
+func getTunnelPathNodesMap(tunnelIDs []int64) map[int64][]int64 {
+	out := make(map[int64][]int64, len(tunnelIDs))
+	if len(tunnelIDs) == 0 {
+		return out
+	}
+	names := make([]string, 0, len(tunnelIDs))
+	nameToID := make(map[string]int64, len(tunnelIDs))
+	for _, id := range tunnelIDs {
+		if id <= 0 {
+			continue
+		}
+		key := fmt.Sprintf("tunnel_path_%d", id)
+		if _, ok := nameToID[key]; ok {
+			continue
+		}
+		nameToID[key] = id
+		names = append(names, key)
+	}
+	if len(names) == 0 {
+		return out
+	}
+	var cfgs []model.ViteConfig
+	if err := dbpkg.DB.Where("name in ?", names).Find(&cfgs).Error; err != nil {
+		return out
+	}
+	for _, cfg := range cfgs {
+		tid, ok := nameToID[cfg.Name]
+		if !ok {
+			continue
+		}
+		out[tid] = parseTunnelPathNodesValue(cfg.Value)
+	}
+	return out
 }
 
 func tunnelLinkModeKey(tid int64) string { return "tunnel_link_modes_" + strconv.FormatInt(tid, 10) }
@@ -2640,6 +2717,21 @@ func appendLocalPorts(nodeID int64, ports map[int]bool) map[int]bool {
 	if err := dbpkg.DB.Where("node_id = ?", nodeID).First(&at).Error; err == nil {
 		if at.Port > 0 {
 			ports[at.Port] = true
+		}
+	}
+	// reserve dedicated AnyTLS instance ports used by existing forwards on this exit node
+	var rows []struct {
+		OutPort int
+	}
+	_ = dbpkg.DB.
+		Table("forward f").
+		Select("f.out_port").
+		Joins("left join tunnel t on t.id = f.tunnel_id").
+		Where("t.out_node_id = ? AND f.out_port IS NOT NULL AND f.out_port > 0 AND lower(trim(coalesce(t.protocol,''))) = 'anytls' AND (f.status IS NULL OR f.status = 1)", nodeID).
+		Scan(&rows).Error
+	for _, row := range rows {
+		if row.OutPort > 0 {
+			ports[row.OutPort] = true
 		}
 	}
 	// include agent-reported used ports snapshot (best-effort)
@@ -2979,13 +3071,25 @@ func preferIface(a *string, b *string) *string {
 }
 
 func getOutNodeIP(t model.Tunnel) string {
-	if t.OutIP != nil && *t.OutIP != "" {
-		return *t.OutIP
+	// AnyTLS: tunnel.out_ip is reused as egress-ip for agent runtime, not dial target.
+	// Dial target should be out-node reachable address (bind/entry IP preferred elsewhere).
+	if !isAnyTLSTunnel(t) {
+		if t.OutIP != nil && *t.OutIP != "" {
+			return *t.OutIP
+		}
 	}
 	if t.OutNodeID != nil {
 		var n model.Node
 		if err := dbpkg.DB.First(&n, *t.OutNodeID).Error; err == nil {
-			return n.ServerIP
+			if ip := strings.TrimSpace(preferIPv4(n)); ip != "" {
+				return ip
+			}
+			if ip := strings.TrimSpace(firstIPAny(n)); ip != "" {
+				return ip
+			}
+			if ip := strings.TrimSpace(n.ServerIP); ip != "" {
+				return ip
+			}
 		}
 	}
 	return "127.0.0.1"
@@ -3063,6 +3167,103 @@ func relayHandler(auth map[string]any) map[string]any {
 		h["auth"] = auth
 	}
 	return h
+}
+
+func applyAddServiceWithResult(nodeID int64, svc map[string]any, opID string, logMsg string) error {
+	if nodeID <= 0 {
+		return fmt.Errorf("%s失败: 节点无效", logMsg)
+	}
+	runApply := func(service map[string]any) error {
+		res, ok := RequestOp(nodeID, "AddService", map[string]interface{}{
+			"requestId": RandUUID(),
+			"services":  expandRUDP([]map[string]any{service}),
+		}, 15*time.Second)
+		if !ok {
+			return fmt.Errorf("agent未响应(AddService超时)")
+		}
+		data, _ := res["data"].(map[string]interface{})
+		success, _ := data["success"].(bool)
+		msg, _ := data["message"].(string)
+		if success {
+			return nil
+		}
+		msg = strings.TrimSpace(msg)
+		if msg == "" {
+			msg = "unknown error"
+		}
+		return fmt.Errorf("%s", msg)
+	}
+	err := runApply(svc)
+	if err != nil {
+		// Fallback: when GOST cannot bind a specific IP, retry with wildcard :port.
+		if fbSvc, ok := fallbackServiceAddrForBindError(svc, err.Error()); ok {
+			if err2 := runApply(fbSvc); err2 == nil {
+				if v, okAddr := fbSvc["addr"].(string); okAddr {
+					svc["addr"] = v
+				}
+				logMsg = logMsg + " (fallback=:port)"
+				err = nil
+			} else {
+				err = fmt.Errorf("%v; fallback失败: %v", err, err2)
+			}
+		}
+	}
+	if b, e := json.Marshal(svc); e == nil {
+		s := string(b)
+		success := 1
+		msg := logMsg
+		if err != nil {
+			success = 0
+			msg = fmt.Sprintf("%s 失败: %v", logMsg, err)
+		}
+		_ = dbpkg.DB.Create(&model.NodeOpLog{
+			TimeMs:    time.Now().UnixMilli(),
+			NodeID:    nodeID,
+			Cmd:       "ForwardAddService",
+			RequestID: opID,
+			Success:   success,
+			Message:   msg,
+			Stdout:    &s,
+		}).Error
+	}
+	if err != nil {
+		return fmt.Errorf("%s失败: %v", logMsg, err)
+	}
+	return nil
+}
+
+func fallbackServiceAddrForBindError(svc map[string]any, applyErr string) (map[string]any, bool) {
+	low := strings.ToLower(applyErr)
+	if !strings.Contains(low, "cannot assign requested address") {
+		return nil, false
+	}
+	addr, _ := svc["addr"].(string)
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return nil, false
+	}
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, false
+	}
+	host = strings.Trim(host, "[]")
+	if host == "" || host == "0.0.0.0" || host == "::" || strings.EqualFold(host, "localhost") || strings.HasPrefix(host, "127.") {
+		return nil, false
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port <= 0 || port > 65535 {
+		return nil, false
+	}
+	cp := map[string]any{}
+	if b, e := json.Marshal(svc); e == nil {
+		_ = json.Unmarshal(b, &cp)
+	} else {
+		for k, v := range svc {
+			cp[k] = v
+		}
+	}
+	cp["addr"] = fmt.Sprintf(":%d", port)
+	return cp, true
 }
 
 // find free out port on out-node range
@@ -3147,4 +3348,193 @@ func directExitPortForTunnel(t model.Tunnel) int {
 func isDirectExitForward(t model.Tunnel, inPort int) bool {
 	directPort := directExitPortForTunnel(t)
 	return directPort > 0 && inPort == directPort
+}
+
+func isAnyTLSTunnel(t model.Tunnel) bool {
+	return strings.EqualFold(strings.TrimSpace(ptrString(t.Protocol)), "anytls")
+}
+
+func anyTLSForwardPortInUseByOther(forwardID int64, outNodeID int64, port int) bool {
+	if outNodeID <= 0 || port <= 0 {
+		return false
+	}
+	var cnt int64
+	dbpkg.DB.
+		Table("forward f").
+		Joins("left join tunnel t on t.id = f.tunnel_id").
+		Where("f.id <> ? AND t.out_node_id = ? AND f.out_port = ? AND lower(trim(coalesce(t.protocol,''))) = 'anytls' AND (f.status IS NULL OR f.status = 1)", forwardID, outNodeID, port).
+		Count(&cnt)
+	return cnt > 0
+}
+
+// prepareForwardAnyTLSInstance ensures a dedicated AnyTLS runtime exists for this forward,
+// so multiple forwards on one exit node can use different exit IP concurrently.
+func prepareForwardAnyTLSInstance(t *model.Tunnel, f *model.Forward, requestedOutPort *int) error {
+	if t == nil || f == nil {
+		return nil
+	}
+	if t.Type != 1 || !isAnyTLSTunnel(*t) {
+		return nil
+	}
+	if t.OutNodeID == nil || *t.OutNodeID <= 0 {
+		return nil
+	}
+	if isDirectExitForward(*t, f.InPort) {
+		return nil
+	}
+	outNodeID := *t.OutNodeID
+	var st model.AnyTLSSetting
+	if err := dbpkg.DB.Where("node_id = ?", outNodeID).First(&st).Error; err != nil || st.ID == 0 {
+		return fmt.Errorf("出口节点未配置AnyTLS")
+	}
+	portMappings := listAnyTLSPortMappings(outNodeID)
+	portEgress := map[int]string{}
+	for _, pm := range portMappings {
+		if pm.Port > 0 {
+			portEgress[pm.Port] = strings.TrimSpace(pm.ExitIP)
+		}
+	}
+	if len(portEgress) == 0 && st.Port > 0 {
+		portEgress[st.Port] = strings.TrimSpace(getAnyTLSExitIP(outNodeID))
+	}
+	if len(portEgress) == 0 {
+		return fmt.Errorf("出口节点未配置AnyTLS端口")
+	}
+	var outNode model.Node
+	_ = dbpkg.DB.First(&outNode, outNodeID).Error
+	selected := 0
+	if requestedOutPort != nil && *requestedOutPort > 0 {
+		selected = *requestedOutPort
+	} else if f.OutPort != nil && *f.OutPort > 0 {
+		if _, ok := portEgress[*f.OutPort]; ok {
+			selected = *f.OutPort
+		}
+	} else if st.Port > 0 {
+		selected = st.Port
+	} else {
+		for p := range portEgress {
+			if p > 0 {
+				selected = p
+				break
+			}
+		}
+	}
+	if selected <= 0 {
+		return fmt.Errorf("出口节点AnyTLS端口无效")
+	}
+	exitIP, ok := portEgress[selected]
+	if !ok {
+		return fmt.Errorf("AnyTLS端口 %d 未在出口设置中配置", selected)
+	}
+	prevPort := 0
+	if f.OutPort != nil && *f.OutPort > 0 {
+		prevPort = *f.OutPort
+	}
+	f.OutPort = &selected
+
+	baseUserID := int64(0)
+	if st.BaseUserID != nil {
+		baseUserID = *st.BaseUserID
+	}
+	if baseUserID == 0 {
+		baseUserID = defaultAnyTLSBaseUserID()
+	}
+	req := map[string]any{
+		"requestId":     RandUUID(),
+		"port":          selected,
+		"password":      st.Password,
+		"enforceVerify": isAnyTLSCertFeatureEnabled(),
+		"allowFallback": true,
+		"users":         buildAnyTLSUsersForNode(outNodeID, st.Password),
+	}
+	if certPayload, err := anyTLSCertPayload(outNodeID, ""); err == nil {
+		for k, v := range certPayload {
+			req[k] = v
+		}
+	} else {
+		return fmt.Errorf("AnyTLS证书生成失败: %v", err)
+	}
+	if baseUserID > 0 {
+		req["baseUserId"] = baseUserID
+	}
+	if strings.TrimSpace(exitIP) != "" {
+		req["exitIp"] = strings.TrimSpace(exitIP)
+	}
+	if res, ok := RequestOp(outNodeID, "SetAnyTLS", req, 12*time.Second); ok {
+		if data, _ := res["data"].(map[string]interface{}); data != nil {
+			if okv, ex := data["success"].(bool); ex && !okv {
+				if msg, _ := data["message"].(string); msg != "" {
+					return fmt.Errorf("AnyTLS实例下发失败: %s", msg)
+				}
+				return fmt.Errorf("AnyTLS实例下发失败")
+			}
+		}
+	} else {
+		return fmt.Errorf("出口节点未响应，AnyTLS实例下发失败")
+	}
+	// Cleanup stale AnyTLS runtime only when previous port is no longer used and no longer configured.
+	_, prevConfigured := portEgress[prevPort]
+	if prevPort > 0 && prevPort != selected && !prevConfigured && !anyTLSForwardPortInUseByOther(f.ID, outNodeID, prevPort) {
+		_, _ = RequestOp(outNodeID, "SetAnyTLS", map[string]any{
+			"requestId": RandUUID(),
+			"port":      prevPort,
+			"remove":    true,
+		}, 8*time.Second)
+	}
+
+	host := ""
+	if t.OutNodeID != nil && *t.OutNodeID > 0 {
+		if bm := getTunnelBindMap(t.ID); bm != nil {
+			if v, ok := bm[*t.OutNodeID]; ok {
+				host = strings.TrimSpace(v)
+			}
+		}
+	}
+	if host == "" {
+		host = strings.TrimSpace(getOutNodeIP(*t))
+	}
+	if host == "" {
+		host = strings.TrimSpace(firstIPAny(outNode))
+	}
+	if host == "" {
+		host = strings.TrimSpace(outNode.ServerIP)
+	}
+	if host == "" {
+		return fmt.Errorf("出口节点地址无效")
+	}
+	f.RemoteAddr = safeHostPort(host, selected)
+	return nil
+}
+
+func cleanupForwardAnyTLSInstance(t model.Tunnel, f model.Forward) {
+	if !isAnyTLSTunnel(t) || t.OutNodeID == nil || *t.OutNodeID <= 0 || f.OutPort == nil || *f.OutPort <= 0 {
+		return
+	}
+	if isDirectExitForward(t, f.InPort) {
+		return
+	}
+	outNodeID := *t.OutNodeID
+	port := *f.OutPort
+	// Configured AnyTLS ports should never be removed by per-forward cleanup.
+	mappings := listAnyTLSPortMappings(outNodeID)
+	for _, pm := range mappings {
+		if pm.Port == port {
+			return
+		}
+	}
+	if len(mappings) == 0 {
+		var st model.AnyTLSSetting
+		if err := dbpkg.DB.Where("node_id = ?", outNodeID).First(&st).Error; err == nil && st.Port > 0 && st.Port == port {
+			return
+		}
+	}
+	if anyTLSForwardPortInUseByOther(f.ID, outNodeID, port) {
+		return
+	}
+	req := map[string]any{
+		"requestId": RandUUID(),
+		"port":      port,
+		"remove":    true,
+	}
+	_, _ = RequestOp(outNodeID, "SetAnyTLS", req, 8*time.Second)
 }

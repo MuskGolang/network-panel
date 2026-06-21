@@ -197,9 +197,22 @@ html, body {
 }
 
 .node-card {
-  content-visibility: visible;
-  contain: none;
-  contain-intrinsic-size: auto;
+  content-visibility: auto;
+  contain: layout paint style;
+  contain-intrinsic-size: 520px 680px;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.node-card .font-mono {
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 640px) {
+  .node-card {
+    border-radius: 14px;
+    contain-intrinsic-size: 420px 720px;
+  }
 }
 
 .skeleton-card {

@@ -118,6 +118,7 @@ interface Forward {
   sbSpeedLogs?: any[];
   sbConnLoading?: boolean;
   sbSpeedLoading?: boolean;
+  egresses?: Array<{ ip: string; suffix?: string }>;
 }
 
 const formatInAddress = (ipString: string, port: number): string => {
@@ -174,6 +175,93 @@ const hasMultipleAddresses = (addressString: string): boolean => {
     .filter((addr) => addr);
 
   return addresses.length > 1;
+};
+
+const normalizeForwardEgresses = (
+  raw: any,
+): Array<{ ip: string; suffix?: string }> => {
+  if (!Array.isArray(raw)) return [];
+  const out: Array<{ ip: string; suffix?: string }> = [];
+  const seen = new Set<string>();
+  raw.forEach((it: any) => {
+    const ip = String(it?.ip || "").trim();
+    const suffix = String(it?.suffix || "").trim();
+    if (!ip) return;
+    const key = `${ip}\u0000${suffix}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(suffix ? { ip, suffix } : { ip });
+  });
+  return out;
+};
+
+const serializeForwardEgresses = (
+  raw: any,
+): string => {
+  const egresses = normalizeForwardEgresses(raw);
+  if (egresses.length === 0) return "";
+  return JSON.stringify(egresses);
+};
+
+const parseForwardEgressesColumn = (
+  raw: string,
+): { egresses: Array<{ ip: string; suffix?: string }>; error?: string } => {
+  const text = String(raw || "").trim();
+  if (!text) return { egresses: [] };
+  try {
+    const parsed = JSON.parse(text);
+    if (!Array.isArray(parsed)) {
+      return { egresses: [], error: "egressesJson 必须是数组JSON" };
+    }
+    const egresses = normalizeForwardEgresses(parsed);
+    if (parsed.length > 0 && egresses.length === 0) {
+      return { egresses: [], error: "egressesJson 解析后无有效出口IP" };
+    }
+    if (
+      egresses.length > 1 &&
+      egresses.some((eg) => !String(eg.suffix || "").trim())
+    ) {
+      return { egresses: [], error: "多出口IP时每个条目都必须带 suffix" };
+    }
+    return { egresses };
+  } catch {
+    return { egresses: [], error: "egressesJson 不是合法JSON" };
+  }
+};
+
+type AnyTLSPortItem = {
+  port: number;
+  exitIp?: string;
+};
+
+const normalizeAnyTLSPorts = (raw: any, fallbackPort?: any, fallbackExitIp?: any): AnyTLSPortItem[] => {
+  const out: AnyTLSPortItem[] = [];
+  const seen = new Set<number>();
+  if (Array.isArray(raw)) {
+    raw.forEach((it: any) => {
+      const p = Number(it?.port || 0);
+      if (p <= 0 || seen.has(p)) return;
+      seen.add(p);
+      out.push({
+        port: p,
+        exitIp: String(it?.exitIp || ""),
+      });
+    });
+  }
+  const fp = Number(fallbackPort || 0);
+  if (fp > 0 && !seen.has(fp)) {
+    out.push({
+      port: fp,
+      exitIp: String(fallbackExitIp || ""),
+    });
+  }
+  return out.sort((a, b) => a.port - b.port);
+};
+
+const firstForwardEgressSuffix = (forward: Forward): string => {
+  const list = normalizeForwardEgresses(forward.egresses);
+  const first = list.find((eg) => String(eg?.suffix || "").trim());
+  return String(first?.suffix || "").trim();
 };
 
 const getCreatedTimeValue = (value?: string): number => {
@@ -440,14 +528,57 @@ const ForwardEditModal = memo(
       (exitNodes || []).forEach((item: any) => {
         if (item?.source !== "node" || item?.nodeId == null) return;
         const nodeId = Number(item.nodeId);
+        const anytlsPorts = normalizeAnyTLSPorts(
+          item?.anytlsPorts,
+          item?.anytlsPort,
+          item?.anytlsExitIp,
+        );
         map[nodeId] = {
           hasSS: !!item?.ssPort,
-          hasAnyTLS: !!item?.anytlsPort,
+          hasAnyTLS: anytlsPorts.length > 0,
         };
       });
 
       return map;
     }, [exitNodes]);
+
+    const exitNodeAnyTLSPortsMap = useMemo(() => {
+      const map: Record<number, AnyTLSPortItem[]> = {};
+      (exitNodes || []).forEach((item: any) => {
+        if (item?.source !== "node" || item?.nodeId == null) return;
+        const nodeId = Number(item.nodeId);
+        map[nodeId] = normalizeAnyTLSPorts(
+          item?.anytlsPorts,
+          item?.anytlsPort,
+          item?.anytlsExitIp,
+        );
+      });
+      return map;
+    }, [exitNodes]);
+
+    const previewTunnelInfo = useMemo(() => {
+      const tid = Number(
+        selectedTunnel?.id || form.tunnelId || editForward?.tunnelId || 0,
+      );
+      if (!tid) return null;
+      return previewTunnelMap?.[tid] || null;
+    }, [selectedTunnel?.id, form.tunnelId, editForward?.tunnelId, previewTunnelMap]);
+
+    const isPreviewOutAnyTLS = useMemo(() => {
+      if (previewType !== 2 || !previewOutNodeId) return false;
+      const proto = String(previewTunnelInfo?.protocol || "")
+        .trim()
+        .toLowerCase();
+      if (proto === "anytls") return true;
+      if (proto === "ss") return false;
+      const cap = exitNodeProtocolMap[previewOutNodeId];
+      return !!(cap?.hasAnyTLS && !cap?.hasSS);
+    }, [previewType, previewOutNodeId, previewTunnelInfo?.protocol, exitNodeProtocolMap]);
+
+    const previewOutAnyTLSPorts = useMemo(() => {
+      if (!previewOutNodeId || !isPreviewOutAnyTLS) return [];
+      return exitNodeAnyTLSPortsMap[previewOutNodeId] || [];
+    }, [previewOutNodeId, isPreviewOutAnyTLS, exitNodeAnyTLSPortsMap]);
 
     const getNodePortRange = useCallback(
       (nodeId?: number) => {
@@ -682,6 +813,10 @@ const ForwardEditModal = memo(
 
         setSelectedTunnel(tunnel || null);
         setForm((prev) => ({ ...prev, tunnelId: tid }));
+        setOutPort(null);
+        setOutPortTouched(false);
+        setMidPorts({});
+        setMidPortsTouched(new Set());
         setRouteItems([]);
         void loadTunnelPreview(tid);
       },
@@ -809,6 +944,28 @@ const ForwardEditModal = memo(
       loadForwardPortPrefs,
     ]);
 
+    useEffect(() => {
+      if (!isOpen) return;
+      if (previewType !== 2) return;
+      if (!isPreviewOutAnyTLS) return;
+      const allowed = previewOutAnyTLSPorts.map((it) => Number(it.port));
+      if (allowed.length === 0) {
+        if (outPort !== null) setOutPort(null);
+        return;
+      }
+      if (outPort && allowed.includes(Number(outPort))) return;
+      if (!outPortTouched) {
+        setOutPort(allowed[0]);
+      }
+    }, [
+      isOpen,
+      previewType,
+      isPreviewOutAnyTLS,
+      previewOutAnyTLSPorts,
+      outPort,
+      outPortTouched,
+    ]);
+
     const validateForm = (): boolean => {
       const newErrors: { [key: string]: string } = {};
       const hasRoute = !isEdit && !form.tunnelId && routeItems.length > 0;
@@ -915,8 +1072,13 @@ const ForwardEditModal = memo(
         }
       }
 
-      if (isEdit && previewType === 2) {
-        if (outPortTouched || outPort !== null) {
+      if (previewType === 2) {
+        if (isPreviewOutAnyTLS) {
+          const allowed = previewOutAnyTLSPorts.map((it) => Number(it.port));
+          if (!outPort || !allowed.includes(Number(outPort))) {
+            newErrors.outPort = "请选择出口节点已配置的 AnyTLS 端口";
+          }
+        } else if (outPortTouched || outPort !== null) {
           if (outPort !== null) {
             if (outPort < 1 || outPort > 65535) {
               newErrors.outPort = "端口号必须在1-65535之间";
@@ -1053,7 +1215,13 @@ const ForwardEditModal = memo(
 
           if (previewType === 2) {
             if (outPortTouched) {
-              updateData.outPort = outPort ? outPort : 0;
+              if (isPreviewOutAnyTLS) {
+                if (outPort && outPort > 0) {
+                  updateData.outPort = outPort;
+                }
+              } else {
+                updateData.outPort = outPort ? outPort : 0;
+              }
             }
             if (midPortsTouched.size > 0) {
               updateData.midPorts = Array.from(midPortsTouched)
@@ -1067,7 +1235,7 @@ const ForwardEditModal = memo(
 
           res = await updateForward(updateData);
         } else {
-          const createData = {
+          const createData: any = {
             name: form.name,
             group: form.group,
             tunnelId: effectiveTunnelId || 0,
@@ -1079,6 +1247,15 @@ const ForwardEditModal = memo(
             interfaceName: form.interfaceName,
             strategy: addressCount > 1 ? form.strategy : "fifo",
           };
+          if (previewType === 2) {
+            if (isPreviewOutAnyTLS) {
+              if (outPort && outPort > 0) {
+                createData.outPort = outPort;
+              }
+            } else if (outPortTouched) {
+              createData.outPort = outPort ? outPort : 0;
+            }
+          }
 
           res = await createForward(createData);
         }
@@ -1492,7 +1669,7 @@ const ForwardEditModal = memo(
                     </Card>
                   )}
 
-                  {isEdit && previewType === 2 && (
+                  {previewType === 2 && (
                     <Card className="np-card">
                       <CardHeader>
                         <div className="font-semibold">隧道监听端口</div>
@@ -1505,32 +1682,67 @@ const ForwardEditModal = memo(
                           </div>
                         )}
                         {previewOutNodeId ? (
-                          <Input
-                            description={(() => {
-                              const range = getNodePortRange(
-                                previewOutNodeId,
-                              );
+                          isPreviewOutAnyTLS ? (
+                            <div className="space-y-2">
+                              <Select
+                                description="仅可选择出口节点已配置的 AnyTLS 端口"
+                                errorMessage={errors.outPort}
+                                isInvalid={!!errors.outPort}
+                                label={`AnyTLS出口端口（${nodeNameMap[previewOutNodeId] || `#${previewOutNodeId}`})`}
+                                placeholder="请选择 AnyTLS 端口"
+                                selectedKeys={
+                                  outPort && outPort > 0 ? [String(outPort)] : []
+                                }
+                                variant="bordered"
+                                onSelectionChange={(keys) => {
+                                  const selectedKey = Array.from(keys)[0] as string;
+                                  const next = selectedKey ? Number(selectedKey) : null;
+                                  setOutPortTouched(true);
+                                  setOutPort(next && next > 0 ? next : null);
+                                }}
+                              >
+                                {previewOutAnyTLSPorts.map((it) => (
+                                  <SelectItem key={String(it.port)}>
+                                    {it.port}
+                                    {it.exitIp ? ` · ${it.exitIp}` : ""}
+                                  </SelectItem>
+                                ))}
+                              </Select>
+                              <div className="text-2xs text-default-400">
+                                当前出口IP：
+                                {(previewOutAnyTLSPorts.find(
+                                  (it) => Number(it.port) === Number(outPort || 0),
+                                )?.exitIp || "-")}
+                              </div>
+                            </div>
+                          ) : (
+                            <Input
+                              description={(() => {
+                                const range = getNodePortRange(
+                                  previewOutNodeId,
+                                );
 
-                              return range.label
-                                ? `允许范围: ${range.label}，留空自动分配`
-                                : "留空自动分配";
-                            })()}
-                            errorMessage={errors.outPort}
-                            isInvalid={!!errors.outPort}
-                            label={`出口端口（${nodeNameMap[previewOutNodeId] || `#${previewOutNodeId}`})`}
-                            placeholder="留空自动分配"
-                            type="number"
-                            value={outPort?.toString() || ""}
-                            variant="bordered"
-                            onChange={(e) => {
-                              const next = e.target.value
-                                ? parseInt(e.target.value)
-                                : null;
+                                return range.label
+                                  ? `允许范围: ${range.label}，留空自动分配`
+                                  : "留空自动分配";
+                              })()}
+                              errorMessage={errors.outPort}
+                              isInvalid={!!errors.outPort}
+                              label={`出口端口（${nodeNameMap[previewOutNodeId] || `#${previewOutNodeId}`})`}
+                              placeholder="留空自动分配"
+                              type="number"
+                              value={outPort?.toString() || ""}
+                              variant="bordered"
+                              onChange={(e) => {
+                                const next = e.target.value
+                                  ? parseInt(e.target.value)
+                                  : null;
 
-                              setOutPortTouched(true);
-                              setOutPort(next);
-                            }}
-                          />
+                                setOutPortTouched(true);
+                                setOutPort(next);
+                              }}
+                            />
+                          )
                         ) : null}
                         {previewPath.map((nid, idx) => (
                           <Input
@@ -1700,6 +1912,13 @@ export default function ForwardPage() {
   const [opsOpen, setOpsOpen] = useState(false);
   const [opReqId, setOpReqId] = useState<string>("");
   const [restartingNodeId, setRestartingNodeId] = useState<number | null>(null);
+  const [egressViewFilter, setEgressViewFilter] = useState<
+    "all" | "single" | "multi"
+  >("all");
+  const [egressKeyword, setEgressKeyword] = useState("");
+  const [egressSortMode, setEgressSortMode] = useState<"created" | "suffix">(
+    "created",
+  );
   const pageVisible = usePageVisibility();
 
   const tunnelOptions = useMemo(
@@ -1736,7 +1955,12 @@ export default function ForwardPage() {
       if (item?.source !== "node" || item?.nodeId == null) return;
       const nodeId = Number(item.nodeId);
       const hasSS = !!item?.ssPort;
-      const hasAny = !!item?.anytlsPort;
+      const hasAny =
+        normalizeAnyTLSPorts(
+          item?.anytlsPorts,
+          item?.anytlsPort,
+          item?.anytlsExitIp,
+        ).length > 0;
       if (hasSS && !hasAny) map[nodeId] = "ss";
       if (!hasSS && hasAny) map[nodeId] = "anytls";
     });
@@ -1753,9 +1977,46 @@ export default function ForwardPage() {
     });
   }, [forwards]);
 
+  const filteredForwards = useMemo(() => {
+    const keyword = egressKeyword.trim().toLowerCase();
+    const list = sortedForwards.filter((f) => {
+      const count = normalizeForwardEgresses(f.egresses).length;
+      if (egressViewFilter === "multi" && count <= 1) return false;
+      if (egressViewFilter === "single" && count > 1) return false;
+      if (!keyword) return true;
+      const egresses = normalizeForwardEgresses(f.egresses);
+      if (egresses.length === 0) return false;
+      return egresses.some((eg) => {
+        const ip = String(eg.ip || "").toLowerCase();
+        const suffix = String(eg.suffix || "").toLowerCase();
+        return ip.includes(keyword) || suffix.includes(keyword);
+      });
+    });
+    if (egressSortMode !== "suffix") return list;
+    return [...list].sort((a, b) => {
+      const aSuffix = firstForwardEgressSuffix(a).toLowerCase();
+      const bSuffix = firstForwardEgressSuffix(b).toLowerCase();
+      const aKey = aSuffix || "\uffff";
+      const bKey = bSuffix || "\uffff";
+      const suffixCmp = aKey.localeCompare(bKey, "en", {
+        numeric: true,
+        sensitivity: "base",
+      });
+      if (suffixCmp !== 0) return suffixCmp;
+      const aName = String(a.name || "");
+      const bName = String(b.name || "");
+      const nameCmp = aName.localeCompare(bName, "zh-Hans-CN", {
+        numeric: true,
+        sensitivity: "base",
+      });
+      if (nameCmp !== 0) return nameCmp;
+      return (a.id || 0) - (b.id || 0);
+    });
+  }, [sortedForwards, egressViewFilter, egressKeyword, egressSortMode]);
+
   const groupedByGroup = useMemo(() => {
     const map = new Map<string, Forward[]>();
-    sortedForwards.forEach((f) => {
+    filteredForwards.forEach((f) => {
       const raw = (f.group || "").trim();
       const groups = raw
         ? raw
@@ -1771,7 +2032,12 @@ export default function ForwardPage() {
       group,
       items,
     }));
-  }, [sortedForwards]);
+  }, [filteredForwards]);
+
+  const isFilterEmpty = useMemo(() => {
+    if (sortedForwards.length === 0) return false;
+    return filteredForwards.length === 0;
+  }, [sortedForwards.length, filteredForwards.length]);
 
   const normalizeId = (id: any) => {
     const n = Number(id);
@@ -1780,10 +2046,10 @@ export default function ForwardPage() {
 
   const allForwardIds = useMemo(
     () =>
-      sortedForwards
+      filteredForwards
         .map((f) => normalizeId(f.id))
         .filter((id) => id > 0),
-    [sortedForwards],
+    [filteredForwards],
   );
   const selectedCount = useMemo(
     () => Array.from(selectedForwardIds).length,
@@ -2064,6 +2330,11 @@ export default function ForwardPage() {
           const ssData = ssRes && ssRes.code === 0 ? ssRes.data : null;
           const anyData = anyRes && anyRes.code === 0 ? anyRes.data : null;
           if (!ssData && !anyData) continue;
+          const anytlsPorts = normalizeAnyTLSPorts(
+            anyData?.anytlsPorts,
+            anyData?.port,
+            anyData?.exitIp,
+          );
           results.push({
             source: "node",
             nodeId,
@@ -2071,7 +2342,8 @@ export default function ForwardPage() {
             host: node?.serverIp || node?.ip || "",
             online: node?.status === 1,
             ssPort: ssData?.port,
-            anytlsPort: anyData?.port,
+            anytlsPort: anytlsPorts[0]?.port,
+            anytlsPorts,
           });
         }
         return results;
@@ -2251,6 +2523,7 @@ export default function ForwardPage() {
         const forwardsData =
           forwardsRes.data?.map((forward: any) => ({
             ...forward,
+            egresses: normalizeForwardEgresses(forward?.egresses),
             serviceRunning: forward.status === 1,
           })) || [];
 
@@ -2962,6 +3235,30 @@ export default function ForwardPage() {
     [copyToClipboard],
   );
 
+  const showForwardEgressesModal = useCallback(
+    (forward: Forward) => {
+      const egresses = normalizeForwardEgresses(forward.egresses);
+      if (egresses.length === 0) return;
+      const lines = egresses.map((eg) =>
+        eg.suffix ? `${eg.suffix}: ${eg.ip}` : eg.ip,
+      );
+      if (lines.length <= 1) {
+        void copyToClipboard(lines[0], `${forward.name} 出口IP`);
+        return;
+      }
+      setAddressList(
+        lines.map((address, index) => ({
+          id: index,
+          address,
+          copying: false,
+        })),
+      );
+      setAddressModalTitle(`${forward.name} 出口IP (${lines.length}个)`);
+      setAddressModalOpen(true);
+    },
+    [copyToClipboard],
+  );
+
   // 复制地址
   const copyAddress = async (addressItem: AddressItem) => {
     try {
@@ -3019,11 +3316,11 @@ export default function ForwardPage() {
         return;
       }
 
-      // 格式化导出数据：remoteAddr|name|inPort|interface（interface 可为空）
+      // 格式化导出数据：remoteAddr|name|inPort|interface|egressesJson
       const exportLines = forwardsToExport.map((forward) => {
         const iface = forward.interfaceName || "";
-
-        return `${forward.remoteAddr}|${forward.name}|${forward.inPort || ""}|${iface}`;
+        const egressesJson = serializeForwardEgresses(forward.egresses);
+        return `${forward.remoteAddr}|${forward.name}|${forward.inPort || ""}|${iface}|${egressesJson}`;
       });
 
       const exportText = exportLines.join("\n");
@@ -3089,9 +3386,17 @@ export default function ForwardPage() {
           continue;
         }
 
-        const [remoteAddr, name, inPort, iface] = parts;
+        const remoteAddrRaw = parts[0] || "";
+        const nameRaw = parts[1] || "";
+        const inPortRaw = parts[2] || "";
+        const ifaceRaw = parts[3] || "";
+        const egressRaw = parts.length >= 5 ? parts.slice(4).join("|") : "";
+        const remoteAddr = remoteAddrRaw.trim();
+        const name = nameRaw.trim();
+        const inPort = inPortRaw.trim();
+        const iface = ifaceRaw.trim();
 
-        if (!remoteAddr.trim() || !name.trim()) {
+        if (!remoteAddr || !name) {
           setImportResults((prev) => [
             {
               line,
@@ -3104,7 +3409,7 @@ export default function ForwardPage() {
         }
 
         // 验证远程地址格式 - 支持单个地址或多个地址用逗号分隔
-        const addresses = remoteAddr.trim().split(",");
+        const addresses = remoteAddr.split(",");
         const addressPattern = /^[^:]+:\d+$/;
         const isValidFormat = addresses.every((addr) =>
           addressPattern.test(addr.trim()),
@@ -3127,8 +3432,8 @@ export default function ForwardPage() {
           // 处理入口端口
           let portNumber: number | null = null;
 
-          if (inPort && inPort.trim()) {
-            const port = parseInt(inPort.trim());
+          if (inPort) {
+            const port = parseInt(inPort);
 
             if (isNaN(port) || port < 1 || port > 65535) {
               setImportResults((prev) => [
@@ -3144,14 +3449,29 @@ export default function ForwardPage() {
             portNumber = port;
           }
 
+          const egressParsed = parseForwardEgressesColumn(egressRaw);
+          if (egressParsed.error) {
+            setImportResults((prev) => [
+              {
+                line,
+                success: false,
+                message: egressParsed.error || "egressesJson 格式错误",
+              },
+              ...prev,
+            ]);
+            continue;
+          }
+
           // 调用创建转发接口
           const response = await createForward({
-            name: name.trim(),
+            name,
             tunnelId: selectedTunnelForImport, // 使用用户选择的隧道
             inPort: portNumber, // 使用指定端口或自动分配
-            remoteAddr: remoteAddr.trim(),
+            remoteAddr,
             strategy: "fifo",
-            interfaceName: iface && iface.trim() ? iface.trim() : undefined,
+            interfaceName: iface || undefined,
+            egresses:
+              egressParsed.egresses.length > 0 ? egressParsed.egresses : undefined,
           });
 
           if (response.code === 0) {
@@ -3160,7 +3480,7 @@ export default function ForwardPage() {
                 line,
                 success: true,
                 message: "创建成功",
-                forwardName: name.trim(),
+                forwardName: name,
               },
               ...prev,
             ]);
@@ -3280,6 +3600,55 @@ export default function ForwardPage() {
           <p className="np-page-desc">管理入口转发与分组配置</p>
         </div>
         <div className="flex items-center gap-3">
+          <Input
+            size="sm"
+            variant="bordered"
+            className="min-w-[220px]"
+            placeholder="筛选后缀/IP (eg. hk, 2001:db8)"
+            value={egressKeyword}
+            onChange={(e) => setEgressKeyword(e.target.value)}
+          />
+          {egressKeyword.trim() ? (
+            <Button
+              size="sm"
+              variant="flat"
+              onPress={() => setEgressKeyword("")}
+            >
+              清空筛选
+            </Button>
+          ) : null}
+          <Select
+            size="sm"
+            variant="bordered"
+            className="min-w-[150px]"
+            selectedKeys={new Set([egressViewFilter])}
+            onSelectionChange={(keys) => {
+              const val = String(Array.from(keys)[0] || "all") as
+                | "all"
+                | "single"
+                | "multi";
+              setEgressViewFilter(val);
+            }}
+          >
+            <SelectItem key="all">全部出口</SelectItem>
+            <SelectItem key="single">单出口</SelectItem>
+            <SelectItem key="multi">多出口</SelectItem>
+          </Select>
+          <Select
+            size="sm"
+            variant="bordered"
+            className="min-w-[150px]"
+            selectedKeys={new Set([egressSortMode])}
+            onSelectionChange={(keys) => {
+              const val = String(Array.from(keys)[0] || "created") as
+                | "created"
+                | "suffix";
+              setEgressSortMode(val);
+            }}
+          >
+            <SelectItem key="created">按创建时间</SelectItem>
+            <SelectItem key="suffix">按后缀排序</SelectItem>
+          </Select>
           <Select
             size="sm"
             variant="bordered"
@@ -3439,7 +3808,7 @@ export default function ForwardPage() {
               <div className="w-full overflow-x-auto">
                 <Table
                   aria-label={`${group} 转发列表`}
-                  className="np-table table-fixed min-w-[1160px]"
+                  className="np-table table-fixed min-w-[1260px]"
                   removeWrapper
                 >
                   <TableHeader>
@@ -3452,7 +3821,7 @@ export default function ForwardPage() {
                   <TableColumn className="w-[280px] min-w-[280px]">
                     入口/出口
                   </TableColumn>
-                  <TableColumn className="w-[120px] min-w-[120px]">
+                  <TableColumn className="w-[220px] min-w-[220px]">
                     协议
                   </TableColumn>
                   <TableColumn className="w-[160px] min-w-[160px]">
@@ -3477,6 +3846,9 @@ export default function ForwardPage() {
                       forward.remoteAddr,
                     );
                     const exitProto = getExitProtocolLabel(forward);
+                    const forwardEgresses = normalizeForwardEgresses(
+                      forward.egresses,
+                    );
                     const connMs =
                       !forward.sbConnErr &&
                       typeof forward.sbConnMs === "number"
@@ -3583,9 +3955,57 @@ export default function ForwardPage() {
                           </div>
                         </TableCell>
                         <TableCell>
-                          <Chip size="sm" variant="flat" color="warning">
-                            {exitProto}
-                          </Chip>
+                          <div className="flex flex-col gap-1 min-w-[180px]">
+                            <Chip size="sm" variant="flat" color="warning">
+                              {exitProto}
+                            </Chip>
+                            {forwardEgresses.length > 0 ? (
+                              <div className="flex flex-col gap-1">
+                                <button
+                                  className="text-left text-2xs text-primary hover:underline"
+                                  title="查看完整出口IP列表"
+                                  onClick={() =>
+                                    showForwardEgressesModal(forward)
+                                  }
+                                >
+                                  出口IP x{forwardEgresses.length}
+                                </button>
+                                <div className="flex flex-wrap gap-1">
+                                  {forwardEgresses
+                                    .slice(0, 2)
+                                    .map((eg, idx) => (
+                                      <Chip
+                                        key={`${forward.id}-eg-${idx}-${eg.ip}-${eg.suffix || ""}`}
+                                        size="sm"
+                                        variant="flat"
+                                      >
+                                        {eg.suffix
+                                          ? `${eg.suffix}: ${eg.ip}`
+                                          : eg.ip}
+                                      </Chip>
+                                    ))}
+                                  {forwardEgresses.length > 2 ? (
+                                    <button
+                                      className="text-2xs text-default-400 hover:underline"
+                                      title={forwardEgresses
+                                        .slice(2)
+                                        .map((eg) =>
+                                          eg.suffix
+                                            ? `${eg.suffix}: ${eg.ip}`
+                                            : eg.ip,
+                                        )
+                                        .join("\n")}
+                                      onClick={() =>
+                                        showForwardEgressesModal(forward)
+                                      }
+                                    >
+                                      +{forwardEgresses.length - 2}
+                                    </button>
+                                  ) : null}
+                                </div>
+                              </div>
+                            ) : null}
+                          </div>
                         </TableCell>
                         <TableCell>
                           <div className="flex items-center gap-2">
@@ -3737,10 +4157,14 @@ export default function ForwardPage() {
               </div>
               <div>
                 <h3 className="text-lg font-semibold text-foreground">
-                  暂无转发配置
+                  {isFilterEmpty ? "当前筛选下暂无转发" : "暂无转发配置"}
                 </h3>
                 <p className="text-default-500 text-sm mt-1">
-                  还没有创建任何转发配置，点击上方按钮开始创建
+                  {isFilterEmpty
+                    ? egressKeyword.trim()
+                      ? `关键词「${egressKeyword.trim()}」无匹配，请调整筛选`
+                      : "请切换筛选条件查看其他转发"
+                    : "还没有创建任何转发配置，点击上方按钮开始创建"}
                 </p>
               </div>
             </div>
@@ -3870,7 +4294,13 @@ export default function ForwardPage() {
           <ModalHeader className="flex flex-col gap-1">
             <h2 className="text-xl font-bold">导出转发数据</h2>
             <p className="text-small text-default-500">
-              格式：目标地址|转发名称|入口端口
+              格式：目标地址|转发名称|入口端口|出口接口IP|egressesJson
+            </p>
+            <p className="text-small text-default-400">
+              egressesJson 示例：
+              <code className="ml-1 font-mono">
+                {`[{"suffix":"hk","ip":"2001:db8::1"}]`}
+              </code>
             </p>
           </ModalHeader>
           <ModalBody className="pb-6">
@@ -4013,10 +4443,10 @@ export default function ForwardPage() {
           <ModalHeader className="flex flex-col gap-1">
             <h2 className="text-xl font-bold">导入转发数据</h2>
             <p className="text-small text-default-500">
-              格式：目标地址|转发名称|入口端口，每行一个，入口端口留空将自动分配可用端口
+              格式：目标地址|转发名称|入口端口|出口接口IP|egressesJson
             </p>
             <p className="text-small text-default-400">
-              目标地址支持单个地址(如：example.com:8080)或多个地址用逗号分隔(如：3.3.3.3:3,4.4.4.4:4)
+              每行一个，入口端口留空自动分配。egressesJson 可留空，或填数组 JSON（多出口必须都带 suffix）。
             </p>
           </ModalHeader>
           <ModalBody className="pb-6">
@@ -4054,7 +4484,7 @@ export default function ForwardPage() {
                   label="导入数据"
                   maxRows={12}
                   minRows={8}
-                  placeholder="请输入要导入的转发数据，格式：目标地址|转发名称|入口端口|出口IP(可选)"
+                  placeholder='示例：87.83.105.138:10087|yxvm-anytls|10087||[{"suffix":"hk","ip":"2001:db8::1"},{"suffix":"us","ip":"2001:db8::2"}]'
                   value={importData}
                   variant="flat"
                   onChange={(e) => setImportData(e.target.value)}

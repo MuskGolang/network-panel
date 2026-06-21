@@ -86,7 +86,7 @@ func ForwardSingboxTest(c *gin.Context) {
 		return
 	}
 
-    outbound, err := buildSingboxOutboundForForward(f, t, nodeID)
+	outbound, egressIP, err := buildSingboxOutboundForForward(f, t, nodeID)
 	if err != nil {
 		c.JSON(http.StatusOK, response.ErrMsg(err.Error()))
 		return
@@ -126,13 +126,14 @@ func ForwardSingboxTest(c *gin.Context) {
 		"url":        url,
 		"duration":   3,
 		"outbound":   outbound,
+		"egressIp":   egressIP,
 		"forwardId":  f.ID,
 		"forwardTag": f.Name,
 	}
 
 	timeout := 10 * time.Second
 	if mode == "speed" {
-		timeout = 18 * time.Second
+		timeout = 45 * time.Second
 	}
 	if err := sendWSCommand(nodeID, "SingboxTest", payload); err != nil {
 		stopLogCaptureForNodes(captureIDs, false)
@@ -244,7 +245,7 @@ func stopLogCaptureForNodes(captureIDs map[int64]string, collect bool) []map[str
 	return out
 }
 
-func buildSingboxOutboundForForward(f model.Forward, t model.Tunnel, testNodeID int64) (map[string]interface{}, error) {
+func buildSingboxOutboundForForward(f model.Forward, t model.Tunnel, testNodeID int64) (map[string]interface{}, string, error) {
 	baseName := strings.TrimSpace(f.Name)
 	if baseName == "" {
 		baseName = "forward"
@@ -255,14 +256,14 @@ func buildSingboxOutboundForForward(f model.Forward, t model.Tunnel, testNodeID 
 	}
 	var entryNode model.Node
 	if err := dbpkg.DB.First(&entryNode, t.InNodeID).Error; err != nil {
-		return nil, fmt.Errorf("入口节点不存在")
+		return nil, "", fmt.Errorf("入口节点不存在")
 	}
-    entryHost := subscriptionEntryHost(t, entryNode)
+	entryHost := subscriptionEntryHost(t, entryNode)
 	if entryHost == "" {
-		return nil, fmt.Errorf("入口IP为空")
+		return nil, "", fmt.Errorf("入口IP为空")
 	}
 	if f.InPort <= 0 {
-		return nil, fmt.Errorf("入口端口无效")
+		return nil, "", fmt.Errorf("入口端口无效")
 	}
 	testPort := f.InPort
 	if dp := directExitPortForTunnel(t); dp > 0 {
@@ -301,22 +302,22 @@ func buildSingboxOutboundForForward(f model.Forward, t model.Tunnel, testNodeID 
 
 	proto, cipher, password, params := resolveExitProtocol(t, ext, ssMap, anyTLSMap)
 	if strings.TrimSpace(proto) == "" {
-		return nil, fmt.Errorf("出口协议为空")
+		return nil, "", fmt.Errorf("出口协议为空")
 	}
 	if !isSupportedProtocol(proto) {
 		if strings.EqualFold(strings.TrimSpace(proto), "tls") {
-			return nil, fmt.Errorf("协议为 tls，未映射，请在出口节点里维护真实协议")
+			return nil, "", fmt.Errorf("协议为 tls，未映射，请在出口节点里维护真实协议")
 		}
-		return nil, fmt.Errorf("不支持协议:%s", proto)
+		return nil, "", fmt.Errorf("不支持协议:%s", proto)
 	}
 	if proto == "ss" && (cipher == "" || password == "") {
-		return nil, fmt.Errorf("SS缺少加密或密码")
+		return nil, "", fmt.Errorf("SS缺少加密或密码")
 	}
 	if proto == "anytls" && password == "" {
-		return nil, fmt.Errorf("AnyTLS缺少密码")
+		return nil, "", fmt.Errorf("AnyTLS缺少密码")
 	}
 	if !requiredParamsReady(proto, subProxy{Type: proto, Cipher: cipher, Password: password, Params: params}, params) {
-		return nil, fmt.Errorf("协议参数不完整")
+		return nil, "", fmt.Errorf("协议参数不完整")
 	}
 	if testPort == f.InPort && t.Type == 1 && len(getTunnelPathNodes(t.ID)) == 0 && t.OutExitID == nil {
 		if (t.OutNodeID == nil || (t.OutNodeID != nil && *t.OutNodeID == t.InNodeID)) && (proto == "anytls" || proto == "ss") {
@@ -331,18 +332,18 @@ func buildSingboxOutboundForForward(f model.Forward, t model.Tunnel, testNodeID 
 			}
 		}
 	}
-    // avoid hairpin/NAT loop when testing on the same node as entry
-    if testNodeID > 0 && testNodeID == t.InNodeID {
-        if isLikelyEntryHost(entryHost, entryNode, t.InIP) {
-            if strings.Contains(entryHost, ":") {
-                entryHost = "::1"
-            } else {
-                entryHost = "127.0.0.1"
-            }
-        }
-    }
+	// avoid hairpin/NAT loop when testing on the same node as entry
+	if testNodeID > 0 && testNodeID == t.InNodeID {
+		if isLikelyEntryHost(entryHost, entryNode, t.InIP) {
+			if strings.Contains(entryHost, ":") {
+				entryHost = "::1"
+			} else {
+				entryHost = "127.0.0.1"
+			}
+		}
+	}
 
-    item := subProxy{
+	item := subProxy{
 		ID:       f.ID,
 		Name:     baseName,
 		Group:    baseGroup,
@@ -355,10 +356,17 @@ func buildSingboxOutboundForForward(f model.Forward, t model.Tunnel, testNodeID 
 	}
 	ob := buildSingboxOutbound(proto, item, params)
 	if len(ob) == 0 {
-		return nil, fmt.Errorf("协议参数不完整")
+		return nil, "", fmt.Errorf("协议参数不完整")
 	}
 	ob["tag"] = "proxy"
-	return ob, nil
+	egressIP := ""
+	if normalizeProtocol(proto) == "anytls" {
+		egressIP = normalizeEgressIP(anyTLSParamString(params, "egress-ip"))
+		if egressIP == "" {
+			egressIP = normalizeEgressIP(ptrString(t.OutIP))
+		}
+	}
+	return ob, egressIP, nil
 }
 
 func isLikelyEntryHost(host string, entryNode model.Node, inIP string) bool {

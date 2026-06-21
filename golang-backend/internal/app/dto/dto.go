@@ -74,6 +74,7 @@ type TunnelDto struct {
 	InNodeID      int64    `json:"inNodeId" binding:"required"`
 	OutNodeID     *int64   `json:"outNodeId"`
 	OutExitID     *int64   `json:"outExitId"`
+	OutIP         *string  `json:"outIp"`
 	Type          int      `json:"type" binding:"required"`
 	Flow          int      `json:"flow"`
 	Protocol      *string  `json:"protocol"`
@@ -88,6 +89,7 @@ type TunnelUpdateDto struct {
 	Name          string   `json:"name"`
 	OutNodeID     *int64   `json:"outNodeId"`
 	OutExitID     *int64   `json:"outExitId"`
+	OutIP         *string  `json:"outIp"`
 	Flow          int64    `json:"flow"`
 	TCPListenAddr *string  `json:"tcpListenAddr"`
 	UDPListenAddr *string  `json:"udpListenAddr"`
@@ -97,15 +99,22 @@ type TunnelUpdateDto struct {
 }
 
 // Forward
+type ForwardEgressDto struct {
+	IP     string `json:"ip"`
+	Suffix string `json:"suffix"`
+}
+
 type ForwardDto struct {
-	Name          string  `json:"name" binding:"required"`
-	Group         string  `json:"group"`
-	TunnelID      int64   `json:"tunnelId"`
-	EntryNodeID   *int64  `json:"entryNodeId"`
-	InPort        *int    `json:"inPort"`
-	RemoteAddr    string  `json:"remoteAddr" binding:"required"`
-	Strategy      *string `json:"strategy"`
-	InterfaceName *string `json:"interfaceName"`
+	Name          string              `json:"name" binding:"required"`
+	Group         string              `json:"group"`
+	TunnelID      int64               `json:"tunnelId"`
+	EntryNodeID   *int64              `json:"entryNodeId"`
+	InPort        *int                `json:"inPort"`
+	OutPort       *int                `json:"outPort"`
+	RemoteAddr    string              `json:"remoteAddr" binding:"required"`
+	Egresses      *[]ForwardEgressDto `json:"egresses"`
+	Strategy      *string             `json:"strategy"`
+	InterfaceName *string             `json:"interfaceName"`
 	// SS 参数移除：统一在节点“出口服务”设置
 }
 
@@ -117,6 +126,7 @@ type ForwardUpdateDto struct {
 	InPort        *int                `json:"inPort"`
 	OutPort       *int                `json:"outPort"`
 	RemoteAddr    string              `json:"remoteAddr"`
+	Egresses      *[]ForwardEgressDto `json:"egresses"`
 	Strategy      *string             `json:"strategy"`
 	InterfaceName *string             `json:"interfaceName"`
 	MidPorts      []ForwardMidPortDto `json:"midPorts"`

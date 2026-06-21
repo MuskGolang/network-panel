@@ -5,7 +5,16 @@ import { Input, Textarea } from "@heroui/input";
 import { Select, SelectItem } from "@heroui/select";
 import { toast } from "react-hot-toast";
 import QRCode from "qrcode";
-import { getConfigByName, updateConfig } from "@/api";
+import {
+  generateAnyTLSCA,
+  getAnyTLSCACheck,
+  getAnyTLSCAStatus,
+  getConfigByName,
+  updateConfig,
+  type AnyTLSCACheckResult,
+  type AnyTLSCAStatus,
+} from "@/api";
+import { isAdmin } from "@/utils/auth";
 
 const buildBaseUrl = () => {
   const raw =
@@ -35,6 +44,7 @@ const copyText = async (text: string, label: string) => {
 };
 
 export default function SubscriptionPage() {
+  const admin = useMemo(() => isAdmin(), []);
   const token = useMemo(() => localStorage.getItem("token") || "", []);
   const baseUrl = useMemo(buildBaseUrl, []);
   const encodedToken = encodeURIComponent(token);
@@ -45,6 +55,12 @@ export default function SubscriptionPage() {
   const [clashFileName, setClashFileName] = useState("");
   const [surgeFileName, setSurgeFileName] = useState("");
   const [saving, setSaving] = useState(false);
+  const [caStatus, setCaStatus] = useState<AnyTLSCAStatus | null>(null);
+  const [caCheck, setCaCheck] = useState<AnyTLSCACheckResult | null>(null);
+  const [caLoading, setCaLoading] = useState(false);
+  const [caGenerating, setCaGenerating] = useState(false);
+  const [caChecking, setCaChecking] = useState(false);
+  const [anytlsCertEnabled, setAnytlsCertEnabled] = useState(false);
   const templateKeyClash = "subscription_clash_template";
   const templateKeySurge = "subscription_surge_template";
 
@@ -118,17 +134,93 @@ export default function SubscriptionPage() {
   }, [qrLink]);
 
   useEffect(() => {
-    getConfigByName(templateKeyClash).then((resp) => {
-      if (resp.code === 0 && typeof resp.data === "string") {
-        setClashTemplate(resp.data || "");
+    const parseEnabled = (v: unknown) => {
+      const s = String(v ?? "")
+        .trim()
+        .toLowerCase();
+      return (
+        s === "1" ||
+        s === "true" ||
+        s === "yes" ||
+        s === "on" ||
+        s === "enabled"
+      );
+    };
+    (async () => {
+      const [clashResp, surgeResp, certEnabledResp] = await Promise.all([
+        getConfigByName(templateKeyClash),
+        getConfigByName(templateKeySurge),
+        getConfigByName("anytls_cert_enabled"),
+      ]);
+      if (clashResp.code === 0 && typeof clashResp.data === "string") {
+        setClashTemplate(clashResp.data || "");
       }
-    });
-    getConfigByName(templateKeySurge).then((resp) => {
-      if (resp.code === 0 && typeof resp.data === "string") {
-        setSurgeTemplate(resp.data || "");
+      if (surgeResp.code === 0 && typeof surgeResp.data === "string") {
+        setSurgeTemplate(surgeResp.data || "");
       }
-    });
+      const enabled = certEnabledResp.code === 0 && parseEnabled(certEnabledResp.data);
+      setAnytlsCertEnabled(enabled);
+      if (admin && enabled) {
+        await refreshCAStatus();
+      }
+    })();
   }, []);
+
+  const fmtTime = (ms?: number) => {
+    if (!ms || ms <= 0) return "-";
+    return new Date(ms).toLocaleString();
+  };
+
+  const refreshCAStatus = async () => {
+    setCaLoading(true);
+    try {
+      const resp = await getAnyTLSCAStatus();
+      if (resp.code === 0 && resp.data) {
+        setCaStatus(resp.data);
+      } else {
+        toast.error(resp.msg || "获取 CA 状态失败");
+      }
+    } finally {
+      setCaLoading(false);
+    }
+  };
+
+  const handleGenerateCA = async () => {
+    if (!window.confirm("将重新生成/轮换站点 CA，确认继续吗？")) {
+      return;
+    }
+    setCaGenerating(true);
+    try {
+      const resp = await generateAnyTLSCA(true);
+      if (resp.code === 0 && resp.data) {
+        setCaStatus(resp.data);
+        toast.success("站点 CA 已生成");
+      } else {
+        toast.error(resp.msg || "生成失败");
+      }
+    } finally {
+      setCaGenerating(false);
+    }
+  };
+
+  const handleCheckCA = async () => {
+    setCaChecking(true);
+    try {
+      const resp = await getAnyTLSCACheck();
+      if (resp.code === 0 && resp.data) {
+        setCaCheck(resp.data);
+        if (resp.data.downloadReady) {
+          toast.success("CA 内容检查通过，可下载导入");
+        } else {
+          toast.error(resp.data.error || "CA 内容检查未通过");
+        }
+      } else {
+        toast.error(resp.msg || "CA 自检失败");
+      }
+    } finally {
+      setCaChecking(false);
+    }
+  };
 
   const readTemplateFile = (
     file: File,
@@ -251,6 +343,115 @@ export default function SubscriptionPage() {
         </Card>
 
         <div className="flex flex-col gap-6">
+          {admin && anytlsCertEnabled && (
+            <Card className="np-card">
+              <CardHeader className="flex items-center justify-between">
+                <h3 className="text-base font-semibold">站点 CA 管理</h3>
+                <div className="text-xs text-default-400">
+                  {caStatus?.caExists ? "已生成" : "未生成"}
+                </div>
+              </CardHeader>
+              <CardBody className="space-y-3">
+                <div className="text-xs text-default-500">
+                  证书目录：{caStatus?.certDir || "-"}
+                </div>
+                <div className="text-xs text-default-500 break-all">
+                  CA 文件：{caStatus?.caCertPath || "-"}
+                </div>
+                <div className="text-xs text-default-500 break-all">
+                  密钥文件：{caStatus?.caKeyPath || "-"}
+                </div>
+                <div className="grid grid-cols-1 gap-2 text-xs text-default-500">
+                  <div>组织：{caStatus?.subjectOrganization || caStatus?.certOrganization || "-"}</div>
+                  <div>通用名：{caStatus?.subjectCommonName || caStatus?.certCommonName || "-"}</div>
+                  <div>签发时间：{fmtTime(caStatus?.notBeforeMs)}</div>
+                  <div>到期时间：{fmtTime(caStatus?.notAfterMs)}</div>
+                  <div>最近更新时间：{fmtTime(caStatus?.caUpdatedAtMs)}</div>
+                  <div>剩余天数：{typeof caStatus?.daysRemaining === "number" ? caStatus.daysRemaining : "-"}</div>
+                  <div>CA 证书周期：5 年</div>
+                  <div>节点证书周期：90 天（Agent 每 24 小时自动拉取）</div>
+                  {caStatus?.parseError && (
+                    <div className="text-danger">证书解析异常：{caStatus.parseError}</div>
+                  )}
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button
+                    size="sm"
+                    variant="bordered"
+                    isLoading={caLoading}
+                    onPress={() => void refreshCAStatus()}
+                  >
+                    刷新状态
+                  </Button>
+                  <Button
+                    size="sm"
+                    color="warning"
+                    isLoading={caGenerating}
+                    onPress={() => void handleGenerateCA()}
+                  >
+                    生成/轮换 CA
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="bordered"
+                    isLoading={caChecking}
+                    onPress={() => void handleCheckCA()}
+                  >
+                    下载前自检
+                  </Button>
+                  <Button
+                    size="sm"
+                    color="primary"
+                    variant="flat"
+                    onPress={() =>
+                      window.open(
+                        `${baseUrl}/api/v1/subscription/docker-ca?token=${encodedToken}&format=pem`,
+                        "_blank",
+                      )
+                    }
+                  >
+                    下载 CA (PEM)
+                  </Button>
+                  <Button
+                    size="sm"
+                    color="secondary"
+                    variant="flat"
+                    onPress={() =>
+                      window.open(
+                        `${baseUrl}/api/v1/subscription/docker-ca?token=${encodedToken}&format=cer`,
+                        "_blank",
+                      )
+                    }
+                  >
+                    下载 CA (CER, macOS/Surge)
+                  </Button>
+                </div>
+                {caCheck && (
+                  <div className="rounded-large border border-default-200 bg-default-50 p-3 text-xs text-default-600 space-y-1">
+                    <div>PEM 首行：{caCheck.pemFirstLine || "-"}</div>
+                    <div>PEM 头格式：{caCheck.pemHeaderOK ? "正常" : "异常"}</div>
+                    <div>X509 解析：{caCheck.parseOK ? "成功" : "失败"}</div>
+                    <div>公钥算法：{caCheck.publicKeyAlgorithm || "-"}</div>
+                    <div>签名算法：{caCheck.signatureAlgorithm || "-"}</div>
+                    <div>可直接下载导入：{caCheck.downloadReady ? "是" : "否"}</div>
+                    {caCheck.error && <div className="text-danger">错误：{caCheck.error}</div>}
+                  </div>
+                )}
+              </CardBody>
+            </Card>
+          )}
+          {admin && !anytlsCertEnabled && (
+            <Card className="np-card">
+              <CardHeader className="flex items-center justify-between">
+                <h3 className="text-base font-semibold">站点 CA 管理</h3>
+                <div className="text-xs text-default-400">已关闭</div>
+              </CardHeader>
+              <CardBody className="text-xs text-default-500">
+                当前「网站配置 -&gt; 启用 AnyTLS 证书管理」为关闭状态，证书签发与下载入口已隐藏。
+              </CardBody>
+            </Card>
+          )}
+
           <Card className="np-card">
             <CardHeader>
               <h3 className="text-base font-semibold">订阅模板</h3>

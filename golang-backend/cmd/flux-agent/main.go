@@ -22,6 +22,7 @@ import (
 	"reflect"
 	"regexp"
 	"runtime"
+	rdebug "runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,16 +33,31 @@ import (
 	"sync"
 	"sync/atomic"
 
+	bt "network-panel/golang-backend/internal/pkg/backtrace"
+
 	"github.com/creack/pty"
 	"github.com/gorilla/websocket"
-	bt "network-panel/golang-backend/internal/pkg/backtrace"
 )
 
 var (
 	newline   = []byte{'\n'}
 	space     = []byte{' '}
 	opLogCh   = make(chan map[string]any, 128)
+	certLogCh = make(chan map[string]any, 256)
 	wsWriteMu sync.Map // map[*websocket.Conn]*sync.Mutex
+	// Reuse one HTTP client for local GOST API calls to reduce allocations.
+	gostAPIHTTPClient = &http.Client{Timeout: 5 * time.Second}
+	// Reuse one HTTP client for panel APIs to avoid repeated allocations.
+	panelHTTPClient = &http.Client{Timeout: 6 * time.Second}
+	// Verbose body logging is disabled by default to reduce memory churn.
+	gostAPIVerboseBody int32 = 0
+	gostAPIBodyCap     int32 = 2048
+	// Sample high-frequency successful API logs (not errors).
+	gostAPISuccessLogEvery int32  = 12
+	gostAPIOpLogOK         int32  = 0
+	gostSvcGetRespCount    uint64 = 0
+	// Unknown message payload logging cap to avoid memory/log spikes.
+	unknownMsgPayloadCap int32 = 512
 )
 
 func wsWriteMuFor(c *websocket.Conn) *sync.Mutex {
@@ -81,7 +97,7 @@ func wsWriteControl(c *websocket.Conn, mt int, data []byte, deadline time.Time) 
 
 // versionBase is the agent semantic version (without role prefix).
 // final reported version is: go-agent-<versionBase> or go-agent2-<versionBase>
-var versionBase = "2.0.0.1"
+var versionBase = "2.0.0.26"
 var version = ""      // computed in main()
 var apiBootDone int32 // 0=not attempted, 1=attempted
 var apiUse int32      // 1=Web API usable
@@ -151,6 +167,66 @@ func getenv(k, def string) string {
 		return v
 	}
 	return def
+}
+
+func tuneRuntimeMemory() {
+	if v := strings.TrimSpace(getenv("AGENT_GOGC", "")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			rdebug.SetGCPercent(n)
+			log.Printf("{\"event\":\"runtime_gc_tuned\",\"gogc\":%d}", n)
+		}
+	}
+	if v := strings.TrimSpace(getenv("AGENT_MEM_LIMIT_MB", "")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit := int64(n) * 1024 * 1024
+			rdebug.SetMemoryLimit(limit)
+			log.Printf("{\"event\":\"runtime_mem_limit_tuned\",\"mb\":%d}", n)
+		}
+	}
+}
+
+func startPprofServer() {
+	addr := strings.TrimSpace(getenv("AGENT_PPROF_ADDR", ""))
+	if addr == "" {
+		return
+	}
+	if _, err := startAgentPprof(addr); err != nil {
+		log.Printf("{\"event\":\"pprof_boot_err\",\"addr\":%q,\"error\":%q}", addr, err.Error())
+	}
+}
+
+func envBool(k string, def bool) bool {
+	v := strings.ToLower(strings.TrimSpace(getenv(k, "")))
+	if v == "" {
+		return def
+	}
+	return v == "1" || v == "true" || v == "yes" || v == "on"
+}
+
+func cappedPayloadString(b []byte, max int) string {
+	if max < 0 {
+		max = 0
+	}
+	if max == 0 {
+		return ""
+	}
+	if len(b) <= max {
+		return string(b)
+	}
+	return string(b[:max]) + "...(truncated)"
+}
+
+func logUnknownMsg(parseErr error, msg []byte) {
+	capN := int(atomic.LoadInt32(&unknownMsgPayloadCap))
+	if capN < 0 {
+		capN = 0
+	}
+	payload := cappedPayloadString(msg, capN)
+	if parseErr != nil {
+		log.Printf("{\"event\":\"unknown_msg\",\"error\":%q,\"payload\":%q}", parseErr.Error(), payload)
+		return
+	}
+	log.Printf("{\"event\":\"unknown_msg\",\"payload\":%q}", payload)
 }
 
 func singleAgentMode() bool {
@@ -259,21 +335,76 @@ func disableService(name string) {
 }
 
 func readPanelConfig() (addr, secret string) {
-	// fallback to /etc/gost/config.json {addr, secret}
-	f, err := os.ReadFile("/etc/gost/config.json")
+	// fallback order:
+	// 1) /etc/gost/config.json {addr, secret}
+	// 2) /etc/default/flux-agent (ADDR/SECRET)
+	// 3) /etc/default/flux-agent2 (ADDR/SECRET)
+	if a, s := readAddrSecretFromJSON("/etc/gost/config.json"); a != "" && s != "" {
+		return a, s
+	}
+	if a, s := readAddrSecretFromEnvFile("/etc/default/flux-agent"); a != "" && s != "" {
+		return a, s
+	}
+	if a, s := readAddrSecretFromEnvFile("/etc/default/flux-agent2"); a != "" && s != "" {
+		return a, s
+	}
+	return "", ""
+}
+
+func readAddrSecretFromJSON(path string) (addr, secret string) {
+	f, err := os.ReadFile(path)
 	if err != nil {
 		return "", ""
 	}
 	var m map[string]any
-	if json.Unmarshal(f, &m) == nil {
-		if v, ok := m["addr"].(string); ok {
-			addr = v
+	if json.Unmarshal(f, &m) != nil {
+		return "", ""
+	}
+	if v, ok := m["addr"].(string); ok {
+		addr = strings.TrimSpace(v)
+	}
+	if v, ok := m["secret"].(string); ok {
+		secret = strings.TrimSpace(v)
+	}
+	return addr, secret
+}
+
+func readAddrSecretFromEnvFile(path string) (addr, secret string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", ""
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
 		}
-		if v, ok := m["secret"].(string); ok {
-			secret = v
+		if strings.HasPrefix(line, "export ") {
+			line = strings.TrimSpace(strings.TrimPrefix(line, "export "))
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key := strings.TrimSpace(k)
+		val := strings.Trim(strings.TrimSpace(v), `"'`)
+		switch key {
+		case "ADDR":
+			if addr == "" {
+				addr = val
+			}
+		case "SECRET":
+			if secret == "" {
+				secret = val
+			}
+		}
+		if addr != "" && secret != "" {
+			return addr, secret
 		}
 	}
-	return
+	return addr, secret
 }
 
 func main() {
@@ -295,6 +426,8 @@ func main() {
 		fmt.Println(version)
 		return
 	}
+	tuneRuntimeMemory()
+	startPprofServer()
 
 	addr := getenv("ADDR", *flagAddr)
 	secret := getenv("SECRET", *flagSecret)
@@ -302,7 +435,7 @@ func main() {
 	if scheme == "" {
 		scheme = "ws"
 	}
-	if addr == "" || secret == "" {
+	for addr == "" || secret == "" {
 		a2, s2 := readPanelConfig()
 		if addr == "" {
 			addr = a2
@@ -310,9 +443,32 @@ func main() {
 		if secret == "" {
 			secret = s2
 		}
+		if addr != "" && secret != "" {
+			break
+		}
+		log.Printf("{\"event\":\"bootstrap_wait_config\",\"addr\":%t,\"secret\":%t,\"retrySec\":5}", addr != "", secret != "")
+		time.Sleep(5 * time.Second)
 	}
-	if addr == "" || secret == "" {
-		log.Fatalf("missing ADDR/SECRET (env or flags) and /etc/gost/config.json fallback")
+	if envBool("AGENT_GOST_API_VERBOSE", false) {
+		atomic.StoreInt32(&gostAPIVerboseBody, 1)
+	}
+	if v := strings.TrimSpace(getenv("AGENT_GOST_API_BODY_CAP", "")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			atomic.StoreInt32(&gostAPIBodyCap, int32(n))
+		}
+	}
+	if v := strings.TrimSpace(getenv("AGENT_GOST_API_SUCCESS_LOG_EVERY", "")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			atomic.StoreInt32(&gostAPISuccessLogEvery, int32(n))
+		}
+	}
+	if envBool("AGENT_GOST_API_OPLOG_OK", false) {
+		atomic.StoreInt32(&gostAPIOpLogOK, 1)
+	}
+	if v := strings.TrimSpace(getenv("AGENT_UNKNOWN_PAYLOAD_CAP", "")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			atomic.StoreInt32(&unknownMsgPayloadCap, int32(n))
+		}
 	}
 
 	// In single-agent mode, prevent agent2 from running persistently
@@ -345,10 +501,35 @@ func main() {
 	setAnyTLSPanelContext(addr, secret, scheme)
 
 	// 不再自动启用 Web API，仅做报告（前端可手动触发启用）。
-	if cfg, ok := loadAnyTLSConfig(); ok {
-		if err := startAnyTLS(cfg); err != nil {
-			log.Printf("{\"event\":\"anytls_boot_err\",\"error\":%q}", err.Error())
+	// 但如果已配置 API 且绑定为 :PORT / 0.0.0.0，则自动纠正到 127.0.0.1:PORT。
+	go func() {
+		time.Sleep(900 * time.Millisecond)
+		_ = normalizeConfiguredGostAPIBindLocalOnly()
+	}()
+	cfgs, ok := loadAnyTLSConfigs()
+	if changed, err := pullAnyTLSCertFromPanel(addr, secret, scheme); err != nil {
+		log.Printf("{\"event\":\"edge_cert_boot_pull_err\",\"error\":%q}", err.Error())
+		emitAnyTLSCertLog("boot_pull_err", "启动时证书拉取失败", map[string]any{"error": err.Error()})
+	} else if changed {
+		log.Printf("{\"event\":\"edge_cert_boot_pulled\"}")
+		emitAnyTLSCertLog("boot_pulled", "启动时证书已更新", nil)
+	} else {
+		log.Printf("{\"event\":\"edge_cert_boot_unchanged\"}")
+		emitAnyTLSCertLog("boot_unchanged", "启动时证书无变化", nil)
+	}
+	if ok {
+		ports := make([]int, 0, len(cfgs))
+		for p := range cfgs {
+			ports = append(ports, p)
 		}
+		sort.Ints(ports)
+		for _, p := range ports {
+			if err := startAnyTLS(cfgs[p]); err != nil {
+				log.Printf("{\"event\":\"edge_boot_err\",\"port\":%d,\"error\":%q}", p, err.Error())
+			}
+		}
+	} else {
+		log.Printf("{\"event\":\"edge_boot_skip\",\"reason\":\"no_valid_edge_config\"}")
 	}
 
 	for {
@@ -410,14 +591,17 @@ func runOnce(wsURL, addr, secret, scheme string) error {
 	// On connect, perform a best-effort reconcile to ensure desired services exist in gost.json.
 	// Only adds missing services; doesn't delete unless STRICT_RECONCILE=1.
 	go func() { time.Sleep(1200 * time.Millisecond); reconcile(addr, secret, scheme) }()
-	// background probes and system info reporting
-	go periodicProbe(addr, secret, scheme)
-	go periodicSystemInfo(c)
-	// Optional periodic reconcile via RECONCILE_INTERVAL (seconds, <=0 to disable). Default 300s.
-	go periodicReconcile(addr, secret, scheme)
-	// Periodically report local gost services snapshot to server for forward status aggregation
 	done := make(chan struct{})
+	defer close(done)
+	// background probes and system info reporting
+	go periodicProbe(addr, secret, scheme, done)
+	go periodicSystemInfo(c, done)
+	// Optional periodic reconcile via RECONCILE_INTERVAL (seconds, <=0 to disable). Default 300s.
+	go periodicReconcile(addr, secret, scheme, done)
+	// Periodically report local gost services snapshot to server for forward status aggregation
 	go periodicReportServices(addr, secret, scheme, done)
+	// Pull AnyTLS cert from controller periodically and hot-reload runtimes when rotated.
+	go periodicAnyTLSCertRefresh(addr, secret, scheme, done)
 	// OpLog forwarder: send queued op logs to server as {type:"OpLog", step, message, data}
 	go func() {
 		for {
@@ -427,6 +611,21 @@ func runOnce(wsURL, addr, secret, scheme string) error {
 					continue
 				}
 				m["type"] = "OpLog"
+				_ = wsWriteJSON(c, m)
+			case <-done:
+				return
+			}
+		}
+	}()
+	// TLSCertLog forwarder: send dedicated cert install/refresh logs.
+	go func() {
+		for {
+			select {
+			case m := <-certLogCh:
+				if m == nil {
+					continue
+				}
+				m["type"] = "TLSCertLog"
 				_ = wsWriteJSON(c, m)
 			case <-done:
 				return
@@ -476,8 +675,16 @@ func runOnce(wsURL, addr, secret, scheme string) error {
 		}
 		ticker := time.NewTicker(time.Duration(pingSec) * time.Second)
 		defer ticker.Stop()
-		for range ticker.C {
-			_ = wsWriteControl(c, websocket.PingMessage, []byte("ping"), time.Now().Add(5*time.Second))
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				if err := wsWriteControl(c, websocket.PingMessage, []byte("ping"), time.Now().Add(5*time.Second)); err != nil {
+					// read loop will reconnect; stop this stale ping goroutine.
+					return
+				}
+			}
 		}
 	}()
 
@@ -485,7 +692,6 @@ func runOnce(wsURL, addr, secret, scheme string) error {
 
 		_, msg, err := c.ReadMessage()
 		if err != nil {
-			close(done)
 			return err
 		}
 		msg = bytes.TrimSpace(bytes.Replace(msg, newline, space, -1))
@@ -507,15 +713,15 @@ func runOnce(wsURL, addr, secret, scheme string) error {
 								if e4 := json.Unmarshal([]byte(s[i:j+1]), &m); e4 == nil {
 									// ok
 								} else {
-									log.Printf("{\"event\":\"unknown_msg\",\"error\":%q,\"payload\":%q}", e4.Error(), string(msg))
+									logUnknownMsg(e4, msg)
 									continue
 								}
 							} else {
-								log.Printf("{\"event\":\"unknown_msg\",\"error\":%q,\"payload\":%q}", e3.Error(), string(msg))
+								logUnknownMsg(e3, msg)
 								continue
 							}
 						} else {
-							log.Printf("{\"event\":\"unknown_msg\",\"error\":%q,\"payload\":%q}", e3.Error(), string(msg))
+							logUnknownMsg(e3, msg)
 							continue
 						}
 					}
@@ -527,15 +733,15 @@ func runOnce(wsURL, addr, secret, scheme string) error {
 							if e5 := json.Unmarshal([]byte(bs[i:j+1]), &m); e5 == nil {
 								// ok
 							} else {
-								log.Printf("{\"event\":\"unknown_msg\",\"error\":%q,\"payload\":%q}", err.Error(), string(msg))
+								logUnknownMsg(e5, msg)
 								continue
 							}
 						} else {
-							log.Printf("{\"event\":\"unknown_msg\",\"error\":%q,\"payload\":%q}", err.Error(), string(msg))
+							logUnknownMsg(err, msg)
 							continue
 						}
 					} else {
-						log.Printf("{\"event\":\"unknown_msg\",\"error\":%q,\"payload\":%q}", err.Error(), string(msg))
+						logUnknownMsg(err, msg)
 						continue
 					}
 				}
@@ -584,25 +790,81 @@ func runOnce(wsURL, addr, secret, scheme string) error {
 					_ = wsWriteJSON(c, map[string]any{"type": "AddServiceResult", "requestId": reqID, "data": map[string]any{"success": true, "message": "ok"}})
 				}
 			}
-		case "SetAnyTLS":
+		case "SetEdgeTLS", "SetAnyTLS":
 			var req struct {
 				RequestID     string           `json:"requestId"`
 				Port          int              `json:"port"`
 				Password      string           `json:"password"`
 				BaseUserID    int64            `json:"baseUserId"`
 				ExitIP        string           `json:"exitIp"`
-				AllowFallback bool             `json:"allowFallback"`
+				CertDomain    string           `json:"certDomain"`
+				CertPEM       string           `json:"certPem"`
+				KeyPEM        string           `json:"keyPem"`
+				CAPEM         string           `json:"caPem"`
+				CertNotBefore int64            `json:"certNotBeforeMs"`
+				CertNotAfter  int64            `json:"certNotAfterMs"`
+				EnforceVerify *bool            `json:"enforceVerify"`
+				AllowFallback *bool            `json:"allowFallback"`
+				Remove        bool             `json:"remove"`
 				Users         []anytlsUserRule `json:"users"`
 			}
 			_ = json.Unmarshal(m.Data, &req)
-			log.Printf("{\"event\":\"anytls_set\",\"port\":%d,\"exitIp\":%q,\"allowFallback\":%v,\"baseUserId\":%d}", req.Port, req.ExitIP, req.AllowFallback, req.BaseUserID)
-			err := applyAnyTLSConfig(req.Port, req.Password, req.ExitIP, req.AllowFallback, req.BaseUserID, req.Users)
+			// Backward compatibility: if controller payload has no cert material,
+			// pull cert once from panel before applying config.
+			if !req.Remove && (strings.TrimSpace(req.CertPEM) == "" || strings.TrimSpace(req.KeyPEM) == "") {
+				changed, perr := pullAnyTLSCertFromPanel(addr, secret, scheme)
+				if perr != nil {
+					log.Printf("{\"event\":\"edge_cert_set_pull_err\",\"error\":%q}", perr.Error())
+					emitAnyTLSCertLog("set_pull_err", "应用出口配置前证书拉取失败", map[string]any{"error": perr.Error()})
+				} else if changed {
+					log.Printf("{\"event\":\"edge_cert_set_pulled\"}")
+					emitAnyTLSCertLog("set_pulled", "应用出口配置前证书已更新", nil)
+				} else {
+					log.Printf("{\"event\":\"edge_cert_set_unchanged\"}")
+					emitAnyTLSCertLog("set_unchanged", "应用出口配置前证书无变化", nil)
+				}
+			}
+			allowFallback := true
+			if req.AllowFallback != nil {
+				allowFallback = *req.AllowFallback
+			}
+			enforceVerify := false
+			if req.EnforceVerify != nil {
+				enforceVerify = *req.EnforceVerify
+			} else if strings.TrimSpace(req.CertPEM) != "" || strings.TrimSpace(req.KeyPEM) != "" {
+				enforceVerify = true
+			}
+			log.Printf("{\"event\":\"edge_set\",\"port\":%d,\"exitIp\":%q,\"enforceVerify\":%v,\"allowFallback\":%v,\"baseUserId\":%d,\"remove\":%v,\"certDomain\":%q}", req.Port, req.ExitIP, enforceVerify, allowFallback, req.BaseUserID, req.Remove, req.CertDomain)
+			var err error
+			if req.Remove {
+				err = removeAnyTLSConfig(req.Port)
+			} else {
+				err = applyAnyTLSConfig(
+					req.Port,
+					req.Password,
+					req.ExitIP,
+					enforceVerify,
+					allowFallback,
+					req.BaseUserID,
+					req.Users,
+					req.CertDomain,
+					req.CertPEM,
+					req.KeyPEM,
+					req.CAPEM,
+					req.CertNotBefore,
+					req.CertNotAfter,
+				)
+			}
 			msg := "ok"
 			if err != nil {
 				msg = err.Error()
 			}
 			if req.RequestID != "" {
-				_ = wsWriteJSON(c, map[string]any{"type": "SetAnyTLSResult", "requestId": req.RequestID, "data": map[string]any{"success": err == nil, "message": msg}})
+				respType := "SetAnyTLSResult"
+				if m.Type == "SetEdgeTLS" {
+					respType = "SetEdgeTLSResult"
+				}
+				_ = wsWriteJSON(c, map[string]any{"type": respType, "requestId": req.RequestID, "data": map[string]any{"success": err == nil, "message": msg}})
 			}
 		case "SingboxTest":
 			var req singboxTestReq
@@ -772,9 +1034,15 @@ func runOnce(wsURL, addr, secret, scheme string) error {
 				_ = wsWriteJSON(c, resp)
 			}()
 		case "EnableGostAPI":
+			var req struct {
+				Port int `json:"port"`
+			}
+			_ = json.Unmarshal(m.Data, &req)
+			port := resolveGostAPIPort(req.Port)
+			cfgPath := resolveGostConfigPathForWrite()
 			// 手动启用 GOST 顶层 API 并重启服务
-			emitOpLog("gost_api", "enable start", map[string]any{"message": "write top-level api and restart gost"})
-			if err := ensureGostAPITopLevel(); err != nil {
+			emitOpLog("gost_api", "enable start", map[string]any{"message": "write top-level api and restart gost", "port": port, "bind": gostAPIBindAddr(port), "configPath": cfgPath})
+			if err := ensureGostAPITopLevel(port); err != nil {
 				emitOpLog("gost_api_err", "enable failed (write)", map[string]any{"error": err.Error()})
 				log.Printf("{\"event\":\"enable_api_failed\",\"error\":%q}", err.Error())
 				continue
@@ -783,10 +1051,49 @@ func runOnce(wsURL, addr, secret, scheme string) error {
 				emitOpLog("gost_api_err", "enable failed (restart)", map[string]any{"error": err.Error()})
 				continue
 			}
+			time.Sleep(600 * time.Millisecond)
+			loopbackOK, detail := verifyGostAPIBindLoopbackOnly(port)
+			emitOpLog("gost_api", "bind verify", map[string]any{
+				"port":         port,
+				"loopbackOnly": loopbackOK,
+				"detail":       detail,
+			})
+			if !loopbackOK {
+				emitOpLog("gost_api_err", "bind verify failed, try normalize services", map[string]any{
+					"port":   port,
+					"detail": detail,
+				})
+				cfg := readGostConfig()
+				removed := removeLegacyAPIServices(cfg, port)
+				if removed > 0 || !gostAPILocalOnlyFromConfig(cfg) {
+					u, p := apiCreds()
+					cfg["api"] = map[string]any{
+						"addr":       gostAPIBindAddr(port),
+						"pathPrefix": "/api",
+						"accesslog":  true,
+						"auth": map[string]any{
+							"username": u,
+							"password": p,
+						},
+					}
+					if err := writeGostConfig(cfg); err == nil {
+						_ = restartGostService()
+						time.Sleep(800 * time.Millisecond)
+						loopbackOK, detail = verifyGostAPIBindLoopbackOnly(port)
+						emitOpLog("gost_api", "bind verify retry", map[string]any{
+							"port":         port,
+							"loopbackOnly": loopbackOK,
+							"detail":       detail,
+							"removed":      removed,
+						})
+					}
+				}
+			}
+			enforceGostAPIFirewall(port)
 			time.Sleep(1200 * time.Millisecond)
 			ok := apiAvailable()
-			emitOpLog("gost_api", "enable done", map[string]any{"available": ok})
-			log.Printf("{\"event\":\"enable_api_done\",\"ok\":%v}", ok)
+			emitOpLog("gost_api", "enable done", map[string]any{"available": ok, "port": port, "bind": gostAPIBindAddr(port), "configPath": cfgPath})
+			log.Printf("{\"event\":\"enable_api_done\",\"ok\":%v,\"port\":%d,\"bind\":%q,\"configPath\":%q}", ok, port, gostAPIBindAddr(port), cfgPath)
 			// update cached usable state
 			if ok {
 				atomic.StoreInt32(&apiUse, 1)
@@ -794,11 +1101,23 @@ func runOnce(wsURL, addr, secret, scheme string) error {
 			continue
 		case "UpgradeAgent":
 			// optional payload: {to: "go-agent-1.x.y"}
-			go func() { _ = selfUpgrade(addr, scheme) }()
+			if !envBool("AGENT_AUTO_UPGRADE", true) {
+				log.Printf("{\"event\":\"agent_upgrade_skip\",\"reason\":\"disabled_by_env\"}")
+			} else {
+				go func() { _ = selfUpgrade(addr, scheme) }()
+			}
 		case "UpgradeAgent1":
-			go func() { _ = upgradeAgent1(addr, scheme, "") }()
+			if !envBool("AGENT_AUTO_UPGRADE", true) {
+				log.Printf("{\"event\":\"agent_upgrade_skip\",\"reason\":\"disabled_by_env\",\"target\":\"agent1\"}")
+			} else {
+				go func() { _ = upgradeAgent1(addr, scheme, "") }()
+			}
 		case "UpgradeAgent2":
-			go func() { _ = upgradeAgent2(addr, scheme, "") }()
+			if !envBool("AGENT_AUTO_UPGRADE", true) {
+				log.Printf("{\"event\":\"agent_upgrade_skip\",\"reason\":\"disabled_by_env\",\"target\":\"agent2\"}")
+			} else {
+				go func() { _ = upgradeAgent2(addr, scheme, "") }()
+			}
 		case "RestartGost":
 			go func() { _ = restartGostService() }()
 		case "UninstallAgent":
@@ -911,6 +1230,80 @@ func runOnce(wsURL, addr, secret, scheme string) error {
 				res := map[string]any{"type": "StopServiceResult", "requestId": reqID, "data": map[string]any{"success": ok}}
 				_ = wsWriteJSON(c, res)
 			}()
+		case "PprofControl":
+			var req struct {
+				RequestID string `json:"requestId"`
+				Action    string `json:"action"`
+				Addr      string `json:"addr"`
+			}
+			_ = json.Unmarshal(m.Data, &req)
+			go func() {
+				action := strings.ToLower(strings.TrimSpace(req.Action))
+				if action == "" {
+					action = "status"
+				}
+				out := map[string]any{"success": true, "action": action}
+				switch action {
+				case "enable", "start":
+					addr, err := startAgentPprof(req.Addr)
+					if err != nil {
+						out["success"] = false
+						out["message"] = err.Error()
+					} else {
+						out["enabled"] = true
+						out["addr"] = addr
+						out["message"] = "pprof enabled"
+					}
+				case "disable", "stop":
+					if err := stopAgentPprof(); err != nil {
+						out["success"] = false
+						out["message"] = err.Error()
+					} else {
+						out["enabled"] = false
+						out["message"] = "pprof disabled"
+					}
+				case "status":
+					st := agentPprofStatus()
+					for k, v := range st {
+						out[k] = v
+					}
+				default:
+					out["success"] = false
+					out["message"] = "unsupported action"
+				}
+				if req.RequestID != "" {
+					_ = wsWriteJSON(c, map[string]any{
+						"type":      "PprofControlResult",
+						"requestId": req.RequestID,
+						"data":      out,
+					})
+				}
+			}()
+		case "PprofFetch":
+			var req struct {
+				RequestID string `json:"requestId"`
+				Profile   string `json:"profile"`
+				Debug     int    `json:"debug"`
+			}
+			_ = json.Unmarshal(m.Data, &req)
+			go func() {
+				out := map[string]any{"success": true, "profile": req.Profile}
+				content, addr, err := fetchAgentPprofText(req.Profile, req.Debug)
+				if err != nil {
+					out["success"] = false
+					out["message"] = err.Error()
+				} else {
+					out["addr"] = addr
+					out["content"] = content
+				}
+				if req.RequestID != "" {
+					_ = wsWriteJSON(c, map[string]any{
+						"type":      "PprofFetchResult",
+						"requestId": req.RequestID,
+						"data":      out,
+					})
+				}
+			}()
 		default:
 			// ignore unknown
 		}
@@ -919,11 +1312,15 @@ func runOnce(wsURL, addr, secret, scheme string) error {
 
 // apiEnsureIfUnavailable tries to enable Web API if not currently available (single attempt per call).
 func apiEnsureIfUnavailable() bool {
-	if apiAvailable() {
+	cfg := readGostConfig()
+	if apiAvailable() && gostAPILocalOnlyFromConfig(cfg) {
 		atomic.StoreInt32(&apiUse, 1)
 		return true
 	}
-	if err := ensureGostAPITopLevel(); err != nil {
+	if !gostAPILocalOnlyFromConfig(cfg) {
+		log.Printf("{\"event\":\"gost_api_rebind_local\",\"from\":%v}", cfg["api"])
+	}
+	if err := ensureGostAPITopLevel(0); err != nil {
 		return false
 	}
 	if !tryRestartService("gost") {
@@ -935,6 +1332,57 @@ func apiEnsureIfUnavailable() bool {
 		atomic.StoreInt32(&apiUse, 1)
 	}
 	return ok
+}
+
+// normalizeConfiguredGostAPIBindLocalOnly rewrites api.addr to 127.0.0.1:<port>
+// when API is already configured but bound to wildcard/non-loopback.
+// It does not enable API for nodes that never configured API.
+func normalizeConfiguredGostAPIBindLocalOnly() bool {
+	cfg := readGostConfig()
+	if cfg == nil {
+		return false
+	}
+	apiRaw, hasAPI := cfg["api"]
+	if !hasAPI || apiRaw == nil {
+		return false
+	}
+	if gostAPILocalOnlyFromConfig(cfg) {
+		return false
+	}
+	oldAPI := fmt.Sprintf("%v", apiRaw)
+	port := resolveGostAPIPort(0)
+	forceLocalGostAPITopLevel(cfg, port)
+	if err := writeGostConfig(cfg); err != nil {
+		log.Printf("{\"event\":\"gost_api_localize_err\",\"error\":%q}", err.Error())
+		emitOpLog("gost_api_err", "localize configured api failed", map[string]any{
+			"error": err.Error(),
+		})
+		return false
+	}
+	log.Printf("{\"event\":\"gost_api_localize\",\"from\":%q,\"to\":%q,\"port\":%d}", oldAPI, gostAPIBindAddr(port), port)
+	emitOpLog("gost_api", "localize configured api", map[string]any{
+		"from": oldAPI,
+		"to":   gostAPIBindAddr(port),
+		"port": port,
+	})
+	if !tryRestartService("gost") {
+		log.Printf("{\"event\":\"gost_api_localize_restart_err\"}")
+		emitOpLog("gost_api_err", "localize configured api restart failed", map[string]any{
+			"port": port,
+		})
+		return false
+	}
+	time.Sleep(700 * time.Millisecond)
+	okLoop, detail := verifyGostAPIBindLoopbackOnly(port)
+	emitOpLog("gost_api", "bind verify", map[string]any{
+		"port":         port,
+		"loopbackOnly": okLoop,
+		"detail":       detail,
+	})
+	if okLoop {
+		enforceGostAPIFirewall(port)
+	}
+	return okLoop
 }
 
 // ---- Periodic system info reporting over WS ----
@@ -1059,17 +1507,86 @@ func uptimeSeconds() int64 {
 	return int64(f)
 }
 
-func periodicSystemInfo(c *websocket.Conn) {
+type agentRuntimeMetrics struct {
+	HeapAllocMB   float64
+	HeapInuseMB   float64
+	StackInuseMB  float64
+	SysMB         float64
+	RSSMB         float64
+	NumGC         uint32
+	LastPauseMs   float64
+	GCCPUPercent  float64
+	GoRoutines    int
+	CollectedAtMs int64
+}
+
+func readProcessRSSMB() float64 {
+	// Linux: /proc/self/statm: size resident shared text lib data dt
+	b, err := os.ReadFile("/proc/self/statm")
+	if err != nil {
+		return 0
+	}
+	parts := strings.Fields(string(b))
+	if len(parts) < 2 {
+		return 0
+	}
+	pages, err := strconv.ParseFloat(parts[1], 64)
+	if err != nil || pages <= 0 {
+		return 0
+	}
+	return pages * float64(os.Getpagesize()) / (1024 * 1024)
+}
+
+func readAgentRuntimeMetrics() agentRuntimeMetrics {
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	lastPause := 0.0
+	if ms.NumGC > 0 {
+		lastPause = float64(ms.PauseNs[(ms.NumGC+255)%256]) / 1e6
+	}
+	return agentRuntimeMetrics{
+		HeapAllocMB:   float64(ms.HeapAlloc) / (1024 * 1024),
+		HeapInuseMB:   float64(ms.HeapInuse) / (1024 * 1024),
+		StackInuseMB:  float64(ms.StackInuse) / (1024 * 1024),
+		SysMB:         float64(ms.Sys) / (1024 * 1024),
+		RSSMB:         readProcessRSSMB(),
+		NumGC:         ms.NumGC,
+		LastPauseMs:   lastPause,
+		GCCPUPercent:  ms.GCCPUFraction * 100.0,
+		GoRoutines:    runtime.NumGoroutine(),
+		CollectedAtMs: time.Now().UnixMilli(),
+	}
+}
+
+func periodicSystemInfo(c *websocket.Conn, done <-chan struct{}) {
 	sec := 10
 	if v := getenv("AGENT_SYSINFO_SEC", ""); v != "" {
 		if n, _ := strconv.Atoi(v); n > 0 {
 			sec = n
 		}
 	}
-	usedSec := 10
+	usedSec := 30
 	if v := getenv("AGENT_USED_PORTS_SEC", ""); v != "" {
 		if n, _ := strconv.Atoi(v); n > 0 {
 			usedSec = n
+		}
+	}
+	ifaceSec := 300
+	if v := getenv("AGENT_IFACES_SEC", ""); v != "" {
+		if n, _ := strconv.Atoi(v); n > 0 {
+			ifaceSec = n
+		}
+	}
+	agentMemSec := 30
+	if v := getenv("AGENT_AGENT_MEM_SEC", ""); v != "" {
+		if n, _ := strconv.Atoi(v); n > 0 {
+			agentMemSec = n
+		}
+	}
+	usedMax := 128
+	if v := getenv("AGENT_USED_PORTS_MAX", ""); v != "" {
+		if n, _ := strconv.Atoi(v); n > 0 {
+			usedMax = n
 		}
 	}
 	logSysinfo := false
@@ -1081,10 +1598,18 @@ func periodicSystemInfo(c *websocket.Conn) {
 	defer ticker.Stop()
 	var lastPorts []int
 	var lastPortsAt time.Time
+	var lastIfaces []string
+	var lastIfacesAt time.Time
+	var lastAgentMem agentRuntimeMetrics
+	var lastAgentMemAt time.Time
 	for {
 		rx, tx := netBytes()
-		// gather interface list (best-effort)
-		ifaces := getInterfaces()
+		// refresh interface list periodically (best-effort)
+		if time.Since(lastIfacesAt) >= time.Duration(ifaceSec)*time.Second || lastIfacesAt.IsZero() {
+			lastIfaces = getInterfaces()
+			lastIfacesAt = time.Now()
+		}
+		ifaces := lastIfaces
 		// refresh used ports snapshot periodically
 		if time.Since(lastPortsAt) >= time.Duration(usedSec)*time.Second || lastPortsAt.IsZero() {
 			used := getUsedListeningPorts()
@@ -1093,8 +1618,15 @@ func periodicSystemInfo(c *websocket.Conn) {
 				list = append(list, p)
 			}
 			sort.Ints(list)
+			if usedMax > 0 && len(list) > usedMax {
+				list = list[:usedMax]
+			}
 			lastPorts = list
 			lastPortsAt = time.Now()
+		}
+		if time.Since(lastAgentMemAt) >= time.Duration(agentMemSec)*time.Second || lastAgentMemAt.IsZero() {
+			lastAgentMem = readAgentRuntimeMetrics()
+			lastAgentMemAt = time.Now()
 		}
 		payload := map[string]any{
 			"Uptime": uptimeSeconds(),
@@ -1118,6 +1650,16 @@ func periodicSystemInfo(c *websocket.Conn) {
 		}
 		payload["Interfaces"] = ifaces
 		payload["UsedPorts"] = lastPorts
+		payload["AgentHeapAllocMB"] = lastAgentMem.HeapAllocMB
+		payload["AgentHeapInuseMB"] = lastAgentMem.HeapInuseMB
+		payload["AgentStackInuseMB"] = lastAgentMem.StackInuseMB
+		payload["AgentSysMB"] = lastAgentMem.SysMB
+		payload["AgentRSSMB"] = lastAgentMem.RSSMB
+		payload["AgentNumGC"] = lastAgentMem.NumGC
+		payload["AgentLastGCPauseMs"] = lastAgentMem.LastPauseMs
+		payload["AgentGCCPUPercent"] = lastAgentMem.GCCPUPercent
+		payload["AgentGoRoutines"] = lastAgentMem.GoRoutines
+		payload["AgentMemCollectedAtMs"] = lastAgentMem.CollectedAtMs
 		b, _ := json.Marshal(payload)
 		if logSysinfo {
 			log.Printf("{\"event\":\"sysinfo_report\",\"payload\":%s}", string(b))
@@ -1127,7 +1669,11 @@ func periodicSystemInfo(c *websocket.Conn) {
 			_ = c.Close()
 			return
 		}
-		<-ticker.C
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+		}
 	}
 }
 
@@ -1176,7 +1722,7 @@ func getInterfaces() []string {
 	return ips
 }
 
-func periodicReconcile(addr, secret, scheme string) {
+func periodicReconcile(addr, secret, scheme string, done <-chan struct{}) {
 	interval := 300
 	if v := getenv("RECONCILE_INTERVAL", ""); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -1188,8 +1734,13 @@ func periodicReconcile(addr, secret, scheme string) {
 	}
 	t := time.NewTicker(time.Duration(interval) * time.Second)
 	defer t.Stop()
-	for range t.C {
-		reconcile(addr, secret, scheme)
+	for {
+		select {
+		case <-done:
+			return
+		case <-t.C:
+			reconcile(addr, secret, scheme)
+		}
 	}
 }
 
@@ -1363,25 +1914,125 @@ func handleDiagnose(c *websocket.Conn, d *DiagnoseData) {
 func mustJSON(v any) []byte { b, _ := json.Marshal(v); return b }
 
 // --- gost.json helpers ---
-// prefer installed gost.json under /usr/local/gost, fallback to /etc/gost/gost.json
+// prefer runtime gost process config path, then common locations
 var gostConfigPathCandidates = []string{
 	"/etc/gost/gost.json",
 	"/usr/local/gost/gost.json",
 	"./gost.json",
 }
 
-func resolveGostConfigPathForRead() string {
+func normalizeGostConfigPath(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return ""
+	}
+	p = strings.Trim(p, `"'`)
+	if p == "" {
+		return ""
+	}
+	if !strings.HasSuffix(strings.ToLower(p), ".json") {
+		return ""
+	}
+	if !filepath.IsAbs(p) {
+		p = filepath.Clean(p)
+	}
+	return p
+}
+
+func parseGostConfigPathFromArgs(args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	for i := 0; i < len(args); i++ {
+		a := strings.TrimSpace(args[i])
+		if a == "" {
+			continue
+		}
+		if a == "-C" || a == "--config" {
+			if i+1 < len(args) {
+				if p := normalizeGostConfigPath(args[i+1]); p != "" {
+					return p
+				}
+			}
+			continue
+		}
+		if strings.HasPrefix(a, "-C=") {
+			if p := normalizeGostConfigPath(strings.TrimSpace(strings.TrimPrefix(a, "-C="))); p != "" {
+				return p
+			}
+			continue
+		}
+		if strings.HasPrefix(a, "--config=") {
+			if p := normalizeGostConfigPath(strings.TrimSpace(strings.TrimPrefix(a, "--config="))); p != "" {
+				return p
+			}
+			continue
+		}
+	}
+	return ""
+}
+
+func detectGostConfigPathFromProcess() string {
+	ents, err := os.ReadDir("/proc")
+	if err != nil {
+		return ""
+	}
+	for _, ent := range ents {
+		if !ent.IsDir() {
+			continue
+		}
+		pid := ent.Name()
+		if pid == "" || pid[0] < '0' || pid[0] > '9' {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join("/proc", pid, "cmdline"))
+		if err != nil || len(b) == 0 {
+			continue
+		}
+		parts := strings.Split(string(b), "\x00")
+		args := make([]string, 0, len(parts))
+		hasGost := false
+		for _, p := range parts {
+			s := strings.TrimSpace(p)
+			if s == "" {
+				continue
+			}
+			args = append(args, s)
+			base := strings.ToLower(filepath.Base(s))
+			if base == "gost" {
+				hasGost = true
+			}
+		}
+		if !hasGost || len(args) == 0 {
+			continue
+		}
+		if p := parseGostConfigPathFromArgs(args); p != "" {
+			return p
+		}
+	}
+	return ""
+}
+
+func resolvedGostConfigPath() string {
+	if p := normalizeGostConfigPath(getenv("GOST_CONFIG_PATH", "")); p != "" {
+		return p
+	}
+	if p := detectGostConfigPathFromProcess(); p != "" {
+		return p
+	}
 	for _, p := range gostConfigPathCandidates {
 		if b, err := os.ReadFile(p); err == nil && len(b) > 0 {
 			return p
 		}
 	}
-	// default
 	return "/etc/gost/gost.json"
 }
 
-// Always write to /etc/gost/gost.json to enable API before Web API is available
-func resolveGostConfigPathForWrite() string { return "/etc/gost/gost.json" }
+func resolveGostConfigPathForRead() string {
+	return resolvedGostConfigPath()
+}
+
+func resolveGostConfigPathForWrite() string { return resolvedGostConfigPath() }
 
 func readGostConfig() map[string]any {
 	path := resolveGostConfigPathForRead()
@@ -1411,7 +2062,379 @@ func writeGostConfig(m map[string]any) error {
 
 // --- Web API (gost) helpers ---
 
-func apiBaseURL() string { return "http://127.0.0.1:18080/api" }
+const defaultGostAPIPort = 18080
+const gostAPIGuardStatePath = "/etc/gost/gost_api_guard_port"
+
+func parseGostAPIPort(v string) (int, bool) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0, false
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 || n > 65535 {
+		return 0, false
+	}
+	return n, true
+}
+
+func gostAPIPortFromEnv() (int, bool) {
+	return parseGostAPIPort(getenv("GOST_API_PORT", ""))
+}
+
+func gostAPIPortFromConfig(cfg map[string]any) (int, bool) {
+	if cfg == nil {
+		return 0, false
+	}
+	apiRaw, ok := cfg["api"]
+	if !ok {
+		return 0, false
+	}
+	apiObj, ok := apiRaw.(map[string]any)
+	if !ok || apiObj == nil {
+		return 0, false
+	}
+	addr, _ := apiObj["addr"].(string)
+	_, port, ok := parseGostAPIAddr(addr)
+	if !ok {
+		return 0, false
+	}
+	return port, true
+}
+
+func parseGostAPIAddr(addr string) (host string, port int, ok bool) {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return "", 0, false
+	}
+	if strings.HasPrefix(addr, ":") {
+		if p, ok := parseGostAPIPort(strings.TrimPrefix(addr, ":")); ok {
+			return "", p, true
+		}
+		return "", 0, false
+	}
+	if p, ok := parseGostAPIPort(addr); ok {
+		return "", p, true
+	}
+	h, ps, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", 0, false
+	}
+	p, ok := parseGostAPIPort(ps)
+	if !ok {
+		return "", 0, false
+	}
+	return strings.TrimSpace(strings.Trim(h, "[]")), p, true
+}
+
+func parseHostPortLoose(addr string) (host string, port int, ok bool) {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return "", 0, false
+	}
+	if strings.HasPrefix(addr, "[") {
+		h, ps, err := net.SplitHostPort(addr)
+		if err != nil {
+			return "", 0, false
+		}
+		p, ok := parseGostAPIPort(ps)
+		if !ok {
+			return "", 0, false
+		}
+		return strings.TrimSpace(strings.Trim(h, "[]")), p, true
+	}
+	idx := strings.LastIndex(addr, ":")
+	if idx <= 0 || idx == len(addr)-1 {
+		return "", 0, false
+	}
+	p, ok := parseGostAPIPort(addr[idx+1:])
+	if !ok {
+		return "", 0, false
+	}
+	h := strings.TrimSpace(strings.Trim(addr[:idx], "[]"))
+	return h, p, true
+}
+
+func isLoopbackHost(host string) bool {
+	h := strings.ToLower(strings.TrimSpace(strings.Trim(host, "[]")))
+	if h == "" {
+		return false
+	}
+	if h == "localhost" || h == "127.0.0.1" || h == "::1" {
+		return true
+	}
+	ip := net.ParseIP(h)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback()
+}
+
+func verifyGostAPIBindLoopbackOnly(port int) (bool, string) {
+	ps := strconv.Itoa(port)
+	// 1) prefer ss on linux
+	if _, err := exec.LookPath("ss"); err == nil {
+		cmd := exec.Command("ss", "-ltnH")
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			found := 0
+			var bad []string
+			sc := bufio.NewScanner(bytes.NewReader(out))
+			for sc.Scan() {
+				line := strings.TrimSpace(sc.Text())
+				if line == "" {
+					continue
+				}
+				fields := strings.Fields(line)
+				if len(fields) < 4 {
+					continue
+				}
+				local := fields[3]
+				host, p, ok := parseHostPortLoose(local)
+				if !ok || p != port {
+					continue
+				}
+				found++
+				if !isLoopbackHost(host) {
+					bad = append(bad, local)
+				}
+			}
+			if found == 0 {
+				return false, "ss: no listener found on :" + ps
+			}
+			if len(bad) > 0 {
+				return false, "ss: non-loopback listeners " + strings.Join(bad, ",")
+			}
+			return true, "ss: loopback-only"
+		}
+	}
+	// 2) fallback to lsof heuristic
+	if _, err := exec.LookPath("lsof"); err == nil {
+		cmd := exec.Command("lsof", "-nP", "-iTCP:"+ps, "-sTCP:LISTEN")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return false, "lsof exec failed"
+		}
+		txt := string(out)
+		lines := strings.Split(txt, "\n")
+		found := 0
+		for _, ln := range lines {
+			ln = strings.TrimSpace(ln)
+			if ln == "" || strings.HasPrefix(ln, "COMMAND") {
+				continue
+			}
+			found++
+			l := strings.ToLower(ln)
+			if strings.Contains(l, "*:"+ps) || strings.Contains(l, "0.0.0.0:"+ps) || strings.Contains(l, "[::]:"+ps) {
+				return false, "lsof: non-loopback listener " + ln
+			}
+		}
+		if found == 0 {
+			return false, "lsof: no listener found on :" + ps
+		}
+		return true, "lsof: loopback-only"
+	}
+	return false, "no ss/lsof available"
+}
+
+func serviceAddrPort(svc map[string]any) (int, bool) {
+	if svc == nil {
+		return 0, false
+	}
+	addr, _ := svc["addr"].(string)
+	_, p, ok := parseGostAPIAddr(addr)
+	if !ok {
+		return 0, false
+	}
+	return p, true
+}
+
+func isLegacyAPISvc(svc map[string]any, apiPort int) bool {
+	if svc == nil {
+		return false
+	}
+	p, ok := serviceAddrPort(svc)
+	if !ok || p != apiPort {
+		return false
+	}
+	name := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", svc["name"])))
+	if name == "gost_api" || name == "api" || strings.Contains(name, "gost_api") {
+		return true
+	}
+	if hm, ok := svc["handler"].(map[string]any); ok && hm != nil {
+		ht := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", hm["type"])))
+		if ht == "api" || ht == "webapi" {
+			return true
+		}
+	}
+	return false
+}
+
+func removeLegacyAPIServices(cfg map[string]any, apiPort int) int {
+	if cfg == nil {
+		return 0
+	}
+	arr, ok := cfg["services"].([]any)
+	if !ok || len(arr) == 0 {
+		return 0
+	}
+	out := make([]any, 0, len(arr))
+	removed := 0
+	for _, it := range arr {
+		svc, ok := it.(map[string]any)
+		if !ok {
+			out = append(out, it)
+			continue
+		}
+		if isLegacyAPISvc(svc, apiPort) {
+			removed++
+			continue
+		}
+		out = append(out, it)
+	}
+	if removed > 0 {
+		cfg["services"] = out
+	}
+	return removed
+}
+
+func gostAPILocalOnlyFromConfig(cfg map[string]any) bool {
+	if cfg == nil {
+		return false
+	}
+	apiRaw, ok := cfg["api"]
+	if !ok {
+		return false
+	}
+	apiObj, ok := apiRaw.(map[string]any)
+	if !ok || apiObj == nil {
+		return false
+	}
+	addr, _ := apiObj["addr"].(string)
+	host, _, ok := parseGostAPIAddr(addr)
+	if !ok {
+		return false
+	}
+	return host == "127.0.0.1"
+}
+
+func resolveGostAPIPort(preferred int) int {
+	if preferred > 0 && preferred <= 65535 {
+		return preferred
+	}
+	if p, ok := gostAPIPortFromEnv(); ok {
+		return p
+	}
+	if p, ok := gostAPIPortFromConfig(readGostConfig()); ok {
+		return p
+	}
+	return defaultGostAPIPort
+}
+
+func gostAPIBindAddr(port int) string {
+	p := resolveGostAPIPort(port)
+	return fmt.Sprintf("127.0.0.1:%d", p)
+}
+
+func readGuardedGostAPIPort() int {
+	b, err := os.ReadFile(gostAPIGuardStatePath)
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil || n <= 0 || n > 65535 {
+		return 0
+	}
+	return n
+}
+
+func writeGuardedGostAPIPort(port int) {
+	if port <= 0 || port > 65535 {
+		return
+	}
+	_ = os.MkdirAll("/etc/gost", 0o755)
+	_ = os.WriteFile(gostAPIGuardStatePath, []byte(strconv.Itoa(port)), 0o600)
+}
+
+func runLocalCmd(name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg != "" {
+			return fmt.Errorf("%s: %w: %s", name, err, msg)
+		}
+		return fmt.Errorf("%s: %w", name, err)
+	}
+	return nil
+}
+
+func removeFirewallDropRule(port int, bin string) {
+	if _, err := exec.LookPath(bin); err != nil {
+		return
+	}
+	ps := strconv.Itoa(port)
+	// Remove repeatedly in case duplicated rules were inserted.
+	for i := 0; i < 8; i++ {
+		if err := runLocalCmd(bin, "-D", "INPUT", "!", "-i", "lo", "-p", "tcp", "--dport", ps, "-j", "DROP"); err != nil {
+			break
+		}
+	}
+}
+
+func ensureFirewallDropRule(port int, bin string) error {
+	if _, err := exec.LookPath(bin); err != nil {
+		return nil
+	}
+	ps := strconv.Itoa(port)
+	if err := runLocalCmd(bin, "-C", "INPUT", "!", "-i", "lo", "-p", "tcp", "--dport", ps, "-j", "DROP"); err == nil {
+		return nil
+	}
+	// Insert at top so it takes effect before broad ACCEPT rules.
+	return runLocalCmd(bin, "-I", "INPUT", "1", "!", "-i", "lo", "-p", "tcp", "--dport", ps, "-j", "DROP")
+}
+
+func enforceGostAPIFirewall(port int) {
+	if port <= 0 || port > 65535 {
+		return
+	}
+	if runtime.GOOS != "linux" {
+		return
+	}
+	if !envBool("GOST_API_ENFORCE_LOOPBACK_FIREWALL", true) {
+		return
+	}
+
+	prevPort := readGuardedGostAPIPort()
+	if prevPort > 0 && prevPort != port {
+		removeFirewallDropRule(prevPort, "iptables")
+		removeFirewallDropRule(prevPort, "ip6tables")
+	}
+
+	var errs []string
+	if err := ensureFirewallDropRule(port, "iptables"); err != nil {
+		errs = append(errs, err.Error())
+	}
+	if err := ensureFirewallDropRule(port, "ip6tables"); err != nil {
+		errs = append(errs, err.Error())
+	}
+	if len(errs) > 0 {
+		msg := strings.Join(errs, " | ")
+		log.Printf("{\"event\":\"gost_api_firewall_err\",\"port\":%d,\"error\":%q}", port, msg)
+		emitOpLog("gost_api_err", "loopback firewall guard failed", map[string]any{
+			"port":  port,
+			"error": msg,
+		})
+		return
+	}
+
+	writeGuardedGostAPIPort(port)
+	log.Printf("{\"event\":\"gost_api_firewall_ok\",\"port\":%d}", port)
+	emitOpLog("gost_api", "loopback firewall guard applied", map[string]any{
+		"port": port,
+	})
+}
+
+func apiBaseURL() string { return fmt.Sprintf("http://%s/api", gostAPIBindAddr(0)) }
 
 func md5String(s string) string {
 	sum := md5.Sum([]byte(strings.TrimSpace(s)))
@@ -1473,11 +2496,20 @@ func iperf3Status() (string, int, int) {
 }
 
 // ensureGostAPITopLevel writes top-level api config (not as a service).
-func ensureGostAPITopLevel() error {
+func ensureGostAPITopLevel(preferredPort int) error {
 	cfg := readGostConfig()
+	forceLocalGostAPITopLevel(cfg, preferredPort)
+	return writeGostConfig(cfg)
+}
+
+func forceLocalGostAPITopLevel(cfg map[string]any, preferredPort int) int {
+	if cfg == nil {
+		cfg = map[string]any{}
+	}
 	u, p := apiCreds()
+	port := resolveGostAPIPort(preferredPort)
 	cfg["api"] = map[string]any{
-		"addr":       ":18080",
+		"addr":       gostAPIBindAddr(port),
 		"pathPrefix": "/api",
 		"accesslog":  true,
 		"auth": map[string]any{
@@ -1485,23 +2517,8 @@ func ensureGostAPITopLevel() error {
 			"password": p,
 		},
 	}
-	// remove legacy service-based api if exists
-	if arr, ok := cfg["services"].([]any); ok && len(arr) > 0 {
-		out := make([]any, 0, len(arr))
-		for _, it := range arr {
-			keep := true
-			if m, ok2 := it.(map[string]any); ok2 {
-				if n, _ := m["name"].(string); n == "gost_api" {
-					keep = false
-				}
-			}
-			if keep {
-				out = append(out, it)
-			}
-		}
-		cfg["services"] = out
-	}
-	return writeGostConfig(cfg)
+	_ = removeLegacyAPIServices(cfg, port)
+	return port
 }
 
 // isApiUsable returns last known state for Web API.
@@ -1521,12 +2538,26 @@ func apiBootstrapOnce() bool {
 	if !atomic.CompareAndSwapInt32(&apiBootDone, 0, 1) {
 		return isApiUsable()
 	}
-	if apiAvailable() {
+	cfg := readGostConfig()
+	if apiAvailable() && gostAPILocalOnlyFromConfig(cfg) {
+		if p, ok := gostAPIPortFromConfig(cfg); ok {
+			okLoop, detail := verifyGostAPIBindLoopbackOnly(p)
+			emitOpLog("gost_api", "bind verify", map[string]any{"port": p, "loopbackOnly": okLoop, "detail": detail})
+		}
+		if p, ok := gostAPIPortFromConfig(cfg); ok {
+			enforceGostAPIFirewall(p)
+		} else {
+			enforceGostAPIFirewall(resolveGostAPIPort(0))
+		}
 		atomic.StoreInt32(&apiUse, 1)
 		log.Printf("{\"event\":\"api_available\",\"ok\":true}")
 		return true
 	}
-	if err := ensureGostAPITopLevel(); err != nil {
+	if !gostAPILocalOnlyFromConfig(cfg) {
+		log.Printf("{\"event\":\"gost_api_rebind_local\",\"from\":%v}", cfg["api"])
+	}
+	port := resolveGostAPIPort(0)
+	if err := ensureGostAPITopLevel(0); err != nil {
 		log.Printf("{\"event\":\"api_bootstrap_failed\",\"error\":%q}", err.Error())
 		return false
 	}
@@ -1534,6 +2565,38 @@ func apiBootstrapOnce() bool {
 		log.Printf("{\"event\":\"api_restart_gost_failed\"}")
 		return false
 	}
+	time.Sleep(600 * time.Millisecond)
+	okLoop, detail := verifyGostAPIBindLoopbackOnly(port)
+	emitOpLog("gost_api", "bind verify", map[string]any{"port": port, "loopbackOnly": okLoop, "detail": detail})
+	if !okLoop {
+		emitOpLog("gost_api_err", "bind verify failed, try normalize services", map[string]any{"port": port, "detail": detail})
+		cfg2 := readGostConfig()
+		removed := removeLegacyAPIServices(cfg2, port)
+		if removed > 0 || !gostAPILocalOnlyFromConfig(cfg2) {
+			u, p := apiCreds()
+			cfg2["api"] = map[string]any{
+				"addr":       gostAPIBindAddr(port),
+				"pathPrefix": "/api",
+				"accesslog":  true,
+				"auth": map[string]any{
+					"username": u,
+					"password": p,
+				},
+			}
+			if err := writeGostConfig(cfg2); err == nil {
+				_ = tryRestartService("gost")
+				time.Sleep(800 * time.Millisecond)
+				okLoop, detail = verifyGostAPIBindLoopbackOnly(port)
+				emitOpLog("gost_api", "bind verify retry", map[string]any{
+					"port":         port,
+					"loopbackOnly": okLoop,
+					"detail":       detail,
+					"removed":      removed,
+				})
+			}
+		}
+	}
+	enforceGostAPIFirewall(port)
 	time.Sleep(1500 * time.Millisecond)
 	ok := apiAvailable()
 	if ok {
@@ -1545,9 +2608,22 @@ func apiBootstrapOnce() bool {
 
 func apiDo(method, path string, body []byte) (int, []byte, error) {
 	fullURL := apiBaseURL() + path
+	capN := int(atomic.LoadInt32(&gostAPIBodyCap))
+	if capN <= 0 {
+		capN = 2048
+	}
+	verbose := atomic.LoadInt32(&gostAPIVerboseBody) == 1
 	// log request (masked)
 	if body != nil && len(body) > 0 {
-		log.Printf("{\"event\":\"gost_api_call\",\"method\":%q,\"url\":%q,\"body\":%s}", method, maskURLSecrets(fullURL), string(maskJSONSecrets(body)))
+		if verbose {
+			rb := maskJSONSecrets(body)
+			if len(rb) > capN {
+				rb = rb[:capN]
+			}
+			log.Printf("{\"event\":\"gost_api_call\",\"method\":%q,\"url\":%q,\"body\":%s,\"bodyBytes\":%d}", method, maskURLSecrets(fullURL), string(rb), len(body))
+		} else {
+			log.Printf("{\"event\":\"gost_api_call\",\"method\":%q,\"url\":%q,\"bodyBytes\":%d}", method, maskURLSecrets(fullURL), len(body))
+		}
 	} else {
 		log.Printf("{\"event\":\"gost_api_call\",\"method\":%q,\"url\":%q}", method, maskURLSecrets(fullURL))
 	}
@@ -1557,8 +2633,7 @@ func apiDo(method, path string, body []byte) (int, []byte, error) {
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	cli := &http.Client{Timeout: 5 * time.Second}
-	resp, err := cli.Do(req)
+	resp, err := gostAPIHTTPClient.Do(req)
 	if err != nil {
 		log.Printf("{\"event\":\"gost_api_err\",\"method\":%q,\"url\":%q,\"error\":%q}", method, maskURLSecrets(fullURL), err.Error())
 		emitOpLog("gost_api", "request error", map[string]any{"method": method, "url": maskURLSecrets(fullURL), "error": err.Error()})
@@ -1569,33 +2644,76 @@ func apiDo(method, path string, body []byte) (int, []byte, error) {
 	if resp.StatusCode/100 == 2 {
 		atomic.StoreInt32(&apiUse, 1)
 	}
-	// log response (masked, truncated)
-	const capN = 4096
-	rb := out
-	if len(rb) > capN {
-		rb = rb[:capN]
+	if resp.StatusCode/100 == 2 {
+		logSuccess := true
+		if strings.EqualFold(method, "GET") && path == "/config/services" {
+			every := int(atomic.LoadInt32(&gostAPISuccessLogEvery))
+			if every > 1 {
+				n := atomic.AddUint64(&gostSvcGetRespCount, 1)
+				logSuccess = n%uint64(every) == 1
+			}
+		}
+		if verbose && logSuccess {
+			rb := maskJSONSecrets(out)
+			if len(rb) > capN {
+				rb = rb[:capN]
+			}
+			log.Printf("{\"event\":\"gost_api_resp\",\"method\":%q,\"url\":%q,\"status\":%d,\"bytes\":%d,\"body\":%s}", method, maskURLSecrets(fullURL), resp.StatusCode, len(out), string(rb))
+		} else if logSuccess {
+			log.Printf("{\"event\":\"gost_api_resp\",\"method\":%q,\"url\":%q,\"status\":%d,\"bytes\":%d}", method, maskURLSecrets(fullURL), resp.StatusCode, len(out))
+		}
+		if atomic.LoadInt32(&gostAPIOpLogOK) == 1 || !strings.EqualFold(method, "GET") {
+			emitOpLog("gost_api", fmt.Sprintf("%s %s status=%d", method, path, resp.StatusCode), map[string]any{"method": method, "url": maskURLSecrets(fullURL), "status": resp.StatusCode, "bytes": len(out)})
+		}
+	} else {
+		rb := maskJSONSecrets(out)
+		if len(rb) > capN {
+			rb = rb[:capN]
+		}
+		log.Printf("{\"event\":\"gost_api_resp\",\"method\":%q,\"url\":%q,\"status\":%d,\"bytes\":%d,\"body\":%s}", method, maskURLSecrets(fullURL), resp.StatusCode, len(out), string(rb))
+		emitOpLog("gost_api_err", fmt.Sprintf("%s %s status=%d", method, path, resp.StatusCode), map[string]any{"method": method, "url": maskURLSecrets(fullURL), "status": resp.StatusCode, "bytes": len(out), "body": string(rb)})
 	}
-	log.Printf("{\"event\":\"gost_api_resp\",\"method\":%q,\"url\":%q,\"status\":%d,\"body\":%s}", method, maskURLSecrets(fullURL), resp.StatusCode, string(maskJSONSecrets(rb)))
-	step := "gost_api"
-	if resp.StatusCode/100 != 2 {
-		step = "gost_api_err"
-	}
-	emitOpLog(step, fmt.Sprintf("%s %s status=%d", method, path, resp.StatusCode), map[string]any{"method": method, "url": maskURLSecrets(fullURL), "status": resp.StatusCode, "body": string(maskJSONSecrets(rb))})
 	return resp.StatusCode, out, nil
+}
+
+// apiGetServicesList streams /config/services response to reduce temporary allocations.
+func apiGetServicesList() ([]map[string]any, error) {
+	fullURL := apiBaseURL() + "/config/services"
+	req, _ := http.NewRequest("GET", fullURL, nil)
+	u, p := apiCreds()
+	req.SetBasicAuth(u, p)
+	resp, err := gostAPIHTTPClient.Do(req)
+	if err != nil {
+		log.Printf("{\"event\":\"gost_api_err\",\"method\":%q,\"url\":%q,\"error\":%q}", "GET", maskURLSecrets(fullURL), err.Error())
+		emitOpLog("gost_api", "request error", map[string]any{"method": "GET", "url": maskURLSecrets(fullURL), "error": err.Error()})
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		rb, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		rb = maskJSONSecrets(rb)
+		log.Printf("{\"event\":\"gost_api_resp\",\"method\":%q,\"url\":%q,\"status\":%d,\"bytes\":%d,\"body\":%s}", "GET", maskURLSecrets(fullURL), resp.StatusCode, len(rb), string(rb))
+		emitOpLog("gost_api_err", "GET /config/services non-2xx", map[string]any{"method": "GET", "url": maskURLSecrets(fullURL), "status": resp.StatusCode, "body": string(rb)})
+		return nil, fmt.Errorf("status %d", resp.StatusCode)
+	}
+	atomic.StoreInt32(&apiUse, 1)
+	var list []map[string]any
+	dec := json.NewDecoder(resp.Body)
+	if err := dec.Decode(&list); err != nil {
+		return nil, err
+	}
+	every := int(atomic.LoadInt32(&gostAPISuccessLogEvery))
+	if every <= 1 || atomic.AddUint64(&gostSvcGetRespCount, 1)%uint64(every) == 1 {
+		log.Printf("{\"event\":\"gost_api_resp\",\"method\":%q,\"url\":%q,\"status\":%d,\"items\":%d,\"mode\":%q}", "GET", maskURLSecrets(fullURL), resp.StatusCode, len(list), "stream")
+	}
+	return list, nil
 }
 
 // apiListServiceNames returns the list of service names from local GOST via Web API.
 func apiListServiceNames() ([]string, error) {
-	code, body, err := apiDo("GET", "/config/services", nil)
+	arr, err := apiGetServicesList()
 	if err != nil {
 		return nil, err
-	}
-	if code/100 != 2 {
-		return nil, fmt.Errorf("status %d", code)
-	}
-	var arr []map[string]any
-	if e := json.Unmarshal(body, &arr); e != nil {
-		return nil, e
 	}
 	out := make([]string, 0, len(arr))
 	for _, it := range arr {
@@ -1706,16 +2824,9 @@ func hashServiceSubset(svc map[string]any) string {
 }
 
 func apiListServiceHashes() (map[string]string, error) {
-	code, body, err := apiDo("GET", "/config/services", nil)
+	arr, err := apiGetServicesList()
 	if err != nil {
 		return nil, err
-	}
-	if code/100 != 2 {
-		return nil, fmt.Errorf("status %d", code)
-	}
-	var arr []map[string]any
-	if e := json.Unmarshal(body, &arr); e != nil {
-		return nil, e
 	}
 	out := make(map[string]string, len(arr))
 	for _, it := range arr {
@@ -1728,16 +2839,24 @@ func apiListServiceHashes() (map[string]string, error) {
 	return out, nil
 }
 
-// periodicReportServices polls local GOST services and reports to server every 5s
+// periodicReportServices polls local GOST services and reports to server on change.
 func periodicReportServices(addr, secret, scheme string, done <-chan struct{}) {
-	sec := 5
+	sec := 10
 	if v := getenv("AGENT_SVC_REPORT_SEC", ""); v != "" {
 		if n, _ := strconv.Atoi(v); n > 0 {
 			sec = n
 		}
 	}
+	heartbeatSec := 300
+	if v := getenv("AGENT_SVC_REPORT_HEARTBEAT_SEC", ""); v != "" {
+		if n, _ := strconv.Atoi(v); n > 0 {
+			heartbeatSec = n
+		}
+	}
 	ticker := time.NewTicker(time.Duration(sec) * time.Second)
 	defer ticker.Stop()
+	var lastSig string
+	lastSentAt := time.Time{}
 	for {
 		select {
 		case <-done:
@@ -1754,6 +2873,19 @@ func periodicReportServices(addr, secret, scheme string, done <-chan struct{}) {
 			for k := range hashes {
 				names = append(names, k)
 			}
+			sort.Strings(names)
+			var bld strings.Builder
+			bld.Grow(len(names) * 48)
+			for _, n := range names {
+				bld.WriteString(n)
+				bld.WriteByte('=')
+				bld.WriteString(hashes[n])
+				bld.WriteByte(';')
+			}
+			sig := bld.String()
+			if sig == lastSig && !lastSentAt.IsZero() && time.Since(lastSentAt) < time.Duration(heartbeatSec)*time.Second {
+				continue
+			}
 			payload := map[string]any{"secret": secret, "services": names, "hashes": hashes, "timeMs": time.Now().UnixMilli()}
 			b, _ := json.Marshal(payload)
 			proto := "http"
@@ -1766,6 +2898,8 @@ func periodicReportServices(addr, secret, scheme string, done <-chan struct{}) {
 			req.Header.Set("Content-Type", "application/json")
 			_, _ = http.DefaultClient.Do(req)
 			cancel()
+			lastSig = sig
+			lastSentAt = time.Now()
 		}
 	}
 }
@@ -1793,6 +2927,14 @@ func persistGostConfigSnapshot() error {
 			cfg["api"] = v
 		}
 	}
+	// Always force local-only API bind into snapshot to avoid reverting to :18080 or wildcard.
+	forcePort := resolveGostAPIPort(0)
+	if p, ok := gostAPIPortFromConfig(old); ok {
+		forcePort = p
+	} else if p, ok := gostAPIPortFromConfig(cfg); ok {
+		forcePort = p
+	}
+	forceLocalGostAPITopLevel(cfg, forcePort)
 	// Write to /etc/gost/gost.json
 	// Use our writer to ensure directory exists
 	if err := writeGostConfig(cfg); err != nil {
@@ -1989,6 +3131,15 @@ func emitOpLog(step, message string, data map[string]any) {
 	}
 }
 
+// emitAnyTLSCertLog queues dedicated AnyTLS certificate logs to panel via WS sender (runOnce).
+func emitAnyTLSCertLog(step, message string, data map[string]any) {
+	select {
+	case certLogCh <- map[string]any{"step": step, "message": message, "data": data}:
+	default:
+		// drop when busy
+	}
+}
+
 // apiConfigChains upserts chains via GOST Web API.
 // When updateOnly is true, it will only update existing chains; otherwise upsert.
 func apiConfigChains(chains []map[string]any, updateOnly bool) error {
@@ -2077,6 +3228,9 @@ func apiConfigLimiters(limiters []map[string]any, updateOnly bool) error {
 	if len(limiters) == 0 {
 		return nil
 	}
+	if !isApiUsable() && !apiBootstrapOnce() {
+		return fmt.Errorf("gost web api unavailable: please enable on node")
+	}
 	okCount := 0
 	for _, lm := range limiters {
 		name, _ := lm["name"].(string)
@@ -2115,23 +3269,19 @@ func apiConfigLimiters(limiters []map[string]any, updateOnly bool) error {
 func queryServices(filter string) []map[string]any {
 	// Prefer Web API if available
 	if isApiUsable() {
-		code, body, err := apiDo("GET", "/config/services", nil)
-		if err == nil && code/100 == 2 {
-			var list []map[string]any
-			if json.Unmarshal(body, &list) == nil {
-				// optionally filter by handler
-				if filter != "" {
-					out := make([]map[string]any, 0, len(list))
-					for _, m := range list {
-						h, _ := m["handler"].(string)
-						if strings.EqualFold(h, filter) {
-							out = append(out, m)
-						}
+		if list, err := apiGetServicesList(); err == nil {
+			// optionally filter by handler
+			if filter != "" {
+				out := make([]map[string]any, 0, len(list))
+				for _, m := range list {
+					h, _ := m["handler"].(string)
+					if strings.EqualFold(h, filter) {
+						out = append(out, m)
 					}
-					return out
 				}
-				return list
+				return out
 			}
+			return list
 		}
 	}
 	cfg := readGostConfig()
@@ -2221,16 +3371,25 @@ func portListening(port int) bool {
 // getUsedListeningPorts lists TCP/UDP LISTEN ports via ss; fallback to /proc/net; then probe
 func getUsedListeningPorts() map[int]bool {
 	used := map[int]bool{}
-	// Try ss first (fast and widely available)
+	// Prefer /proc on Linux to avoid spawning `ss` and large command output buffers.
+	for _, p := range []string{"/proc/net/tcp", "/proc/net/tcp6", "/proc/net/udp", "/proc/net/udp6"} {
+		if ports := parseProcNetPorts(p); len(ports) > 0 {
+			for k := range ports {
+				used[k] = true
+			}
+		}
+	}
+	if len(used) > 0 {
+		return used
+	}
+	// Fallback: try ss when /proc parsing is unavailable.
 	if p, err := exec.LookPath("ss"); err == nil {
-		cmd := exec.Command(p, "-lntuH")
-		cmd.Stdout = &bytes.Buffer{}
-		cmd.Stderr = &bytes.Buffer{}
-		if err := cmd.Run(); err == nil {
-			out := cmd.Stdout.(*bytes.Buffer).String()
-			lines := strings.Split(out, "\n")
-			for _, ln := range lines {
-				// lines like: LISTEN 0 128 0.0.0.0:22 ... or [::]:22
+		out, err := exec.Command(p, "-lntuH").Output()
+		if err == nil {
+			for _, ln := range strings.Split(string(out), "\n") {
+				if ln == "" {
+					continue
+				}
 				fields := strings.Fields(ln)
 				for _, f := range fields {
 					if strings.HasSuffix(f, ":*") {
@@ -2248,17 +3407,6 @@ func getUsedListeningPorts() map[int]bool {
 			}
 		}
 	}
-	// Fallback: parse /proc/net/{tcp,udp} and ipv6 variants
-	for _, p := range []string{"/proc/net/tcp", "/proc/net/tcp6", "/proc/net/udp", "/proc/net/udp6"} {
-		if ports := parseProcNetPorts(p); len(ports) > 0 {
-			for k := range ports {
-				used[k] = true
-			}
-		}
-	}
-	if len(used) > 0 {
-		return used
-	}
 	// Fallback minimal: probe a small range around common ports
 	for _, p := range []int{22, 80, 443, 3306, 6379} {
 		if portListening(p) {
@@ -2271,13 +3419,19 @@ func getUsedListeningPorts() map[int]bool {
 // parseProcNetPorts returns listening ports from /proc/net/{tcp,udp} style files.
 func parseProcNetPorts(path string) map[int]bool {
 	ports := map[int]bool{}
-	b, err := ioutil.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return ports
 	}
-	lines := strings.Split(string(b), "\n")
-	for i, ln := range lines {
-		if i == 0 || strings.TrimSpace(ln) == "" {
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	// allow long lines in /proc/net
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	lineNo := 0
+	for sc.Scan() {
+		ln := sc.Text()
+		lineNo++
+		if lineNo == 1 || strings.TrimSpace(ln) == "" {
 			continue
 		}
 		fields := strings.Fields(ln)
@@ -2326,7 +3480,11 @@ func suggestPorts(base, count int) []int {
 // addOrUpdateServices merges provided services into gost.json services array.
 // If updateOnly is true, only update existing by name; otherwise upsert (add if missing).
 func addOrUpdateServices(services []map[string]any, updateOnly bool) error {
-	// 必须使用 Web API；若不可用，直接报错，提示前端去启用 API
+	// 必须使用 Web API；若不可用，先尝试一次自动启用，再报错。
+	if !isApiUsable() && !apiBootstrapOnce() {
+		emitOpLog("gost_api_err", "web api unavailable", map[string]any{"message": "GOST Web API 未启用，请在节点上开启后重试"})
+		return fmt.Errorf("gost web api unavailable: please enable on node")
+	}
 	if isApiUsable() {
 		// extract chains
 		chains := make([]map[string]any, 0)
@@ -2368,6 +3526,22 @@ func addOrUpdateServices(services []map[string]any, updateOnly bool) error {
 		}
 		// no batch; single-object calls only per swagger
 		okCount := 0
+		firstErr := ""
+		errSummary := func(name, action string, code int, body []byte, err error) string {
+			if err != nil {
+				return fmt.Sprintf("service %s %s error: %v", name, action, err)
+			}
+			s := strings.TrimSpace(string(maskJSONSecrets(body)))
+			if len(s) > 220 {
+				s = s[:220] + "..."
+			}
+			return fmt.Sprintf("service %s %s status=%d body=%s", name, action, code, s)
+		}
+		setFirstErr := func(msg string) {
+			if firstErr == "" && strings.TrimSpace(msg) != "" {
+				firstErr = msg
+			}
+		}
 		for _, s := range services {
 			name, _ := s["name"].(string)
 			target := normalizeJSONAny(s)
@@ -2378,16 +3552,20 @@ func addOrUpdateServices(services []map[string]any, updateOnly bool) error {
 					continue
 				}
 				body, _ := json.Marshal(s)
-				if code2, _, err := apiDo("PUT", "/config/services/"+url.PathEscape(name), body); err == nil && code2/100 == 2 {
+				code2, respBody, err := apiDo("PUT", "/config/services/"+url.PathEscape(name), body)
+				if err == nil && code2/100 == 2 {
 					okCount++
 					continue
 				}
+				setFirstErr(errSummary(name, "PUT", code2, respBody, err))
 			} else {
 				body, _ := json.Marshal(s)
-				if code2, _, err := apiDo("POST", "/config/services", body); err == nil && code2/100 == 2 {
+				code2, respBody, err := apiDo("POST", "/config/services", body)
+				if err == nil && code2/100 == 2 {
 					okCount++
 					continue
 				}
+				setFirstErr(errSummary(name, "POST", code2, respBody, err))
 			}
 		}
 		if okCount == len(services) {
@@ -2396,6 +3574,9 @@ func addOrUpdateServices(services []map[string]any, updateOnly bool) error {
 				log.Printf("{\"event\":\"gost_server_persist_err\",\"error\":%q}", err.Error())
 			}
 			return nil
+		}
+		if firstErr != "" {
+			return fmt.Errorf("services api partial/failed: %d/%d (%s)", okCount, len(services), firstErr)
 		}
 		return fmt.Errorf("services api partial/failed: %d/%d", okCount, len(services))
 	}
@@ -2797,8 +3978,7 @@ func httpPostJSON(url string, body any) (int, []byte, error) {
 	b, _ := json.Marshal(body)
 	req, _ := http.NewRequest("POST", url, bytes.NewReader(b))
 	req.Header.Set("Content-Type", "application/json")
-	hc := &http.Client{Timeout: 6 * time.Second}
-	resp, err := hc.Do(req)
+	resp, err := panelHTTPClient.Do(req)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -2815,12 +3995,16 @@ func apiURL(scheme, addr, path string) string {
 	return u.String()
 }
 
-func periodicProbe(addr, secret, scheme string) {
+func periodicProbe(addr, secret, scheme string, done <-chan struct{}) {
 	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
 	for {
 		doProbeOnce(addr, secret, scheme)
-		<-ticker.C
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+		}
 	}
 }
 
@@ -2884,6 +4068,19 @@ func selfUpgrade(addr, scheme string) error {
 		emitOpLog("agent_upgrade_error", "校验失败: "+err.Error(), nil)
 		return err
 	}
+	// Ensure downloaded temp binary is executable before smoke test.
+	if err := os.Chmod(tmp, 0755); err != nil {
+		log.Printf("upgrade chmod err: %v", err)
+		_ = os.Remove(tmp)
+		emitOpLog("agent_upgrade_error", "设置执行权限失败: "+err.Error(), nil)
+		return err
+	}
+	if err := validateBinaryRunnable(tmp); err != nil {
+		log.Printf("upgrade smoke test err: %v", err)
+		_ = os.Remove(tmp)
+		emitOpLog("agent_upgrade_error", "冒烟测试失败: "+err.Error(), nil)
+		return err
+	}
 	emitOpLog("agent_upgrade_validate", "校验通过", nil)
 	_ = safeReplace(target, tmp)
 	_ = os.Chmod(target, 0755)
@@ -2942,6 +4139,16 @@ func upgradeAgent1(addr, scheme, expected string) error {
 		emitOpLog("agent_upgrade_error", "校验失败: "+err.Error(), nil)
 		return err
 	}
+	if err := os.Chmod(tmp, 0755); err != nil {
+		_ = os.Remove(tmp)
+		emitOpLog("agent_upgrade_error", "设置执行权限失败: "+err.Error(), nil)
+		return err
+	}
+	if err := validateBinaryRunnable(tmp); err != nil {
+		_ = os.Remove(tmp)
+		emitOpLog("agent_upgrade_error", "冒烟测试失败: "+err.Error(), nil)
+		return err
+	}
 	emitOpLog("agent_upgrade_validate", "校验通过", nil)
 	_ = safeReplace(target, tmp)
 	_ = os.Chmod(target, 0755)
@@ -2978,6 +4185,16 @@ func upgradeAgent2(addr, scheme, expected string) error {
 	if err := validateBinary(tmp, arch); err != nil {
 		_ = os.Remove(tmp)
 		emitOpLog("agent_upgrade_error", "校验失败: "+err.Error(), nil)
+		return err
+	}
+	if err := os.Chmod(tmp, 0755); err != nil {
+		_ = os.Remove(tmp)
+		emitOpLog("agent_upgrade_error", "设置执行权限失败: "+err.Error(), nil)
+		return err
+	}
+	if err := validateBinaryRunnable(tmp); err != nil {
+		_ = os.Remove(tmp)
+		emitOpLog("agent_upgrade_error", "冒烟测试失败: "+err.Error(), nil)
 		return err
 	}
 	emitOpLog("agent_upgrade_validate", "校验通过", nil)
@@ -3697,6 +4914,79 @@ func validateBinary(path string, arch string) error {
 	case "armv7":
 		if m != elf.EM_ARM {
 			return fmt.Errorf("ELF machine mismatch: %v", m)
+		}
+	}
+	return nil
+}
+
+func validateBinaryRunnable(path string) error {
+	runSmoke := func(bin string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, bin, "-v")
+		out, err := cmd.CombinedOutput()
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("binary smoke test timeout")
+		}
+		if err != nil {
+			msg := strings.TrimSpace(string(out))
+			if len(msg) > 240 {
+				msg = msg[:240]
+			}
+			return fmt.Errorf("binary smoke test failed: %v, output=%q", err, msg)
+		}
+		return nil
+	}
+
+	isExecPermissionErr := func(err error) bool {
+		if err == nil {
+			return false
+		}
+		s := strings.ToLower(err.Error())
+		return strings.Contains(s, "permission denied") || strings.Contains(s, "operation not permitted")
+	}
+
+	// Some systems place /etc/gost on mount options that can block direct exec
+	// for freshly written files. Retry smoke test from /tmp for compatibility.
+	runFromTemp := func(src string) error {
+		in, err := os.Open(src)
+		if err != nil {
+			return fmt.Errorf("open temp source failed: %w", err)
+		}
+		defer in.Close()
+
+		f, err := os.CreateTemp("", "flux-agent-smoke-*")
+		if err != nil {
+			return fmt.Errorf("create temp binary failed: %w", err)
+		}
+		tmpPath := f.Name()
+		defer func() {
+			f.Close()
+			_ = os.Remove(tmpPath)
+		}()
+
+		if _, err := io.Copy(f, in); err != nil {
+			return fmt.Errorf("copy temp binary failed: %w", err)
+		}
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("close temp binary failed: %w", err)
+		}
+		if err := os.Chmod(tmpPath, 0755); err != nil {
+			return fmt.Errorf("chmod temp binary failed: %w", err)
+		}
+		if err := runSmoke(tmpPath); err != nil {
+			return fmt.Errorf("temp smoke test failed: %w", err)
+		}
+		return nil
+	}
+
+	if err := runSmoke(path); err != nil {
+		if !isExecPermissionErr(err) {
+			return err
+		}
+		log.Printf("{\"event\":\"agent_upgrade_smoke_fallback\",\"reason\":\"permission\",\"path\":%q}", path)
+		if err2 := runFromTemp(path); err2 != nil {
+			return fmt.Errorf("%v; fallback-to-/tmp failed: %v", err, err2)
 		}
 	}
 	return nil

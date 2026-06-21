@@ -1193,12 +1193,21 @@ export default function NodePage() {
   );
   const pageVisible = usePageVisibility();
   const [pollMs, setPollMs] = useState<number>(5000);
+  const pendingWsStatusRef = useRef<Map<number, "online" | "offline">>(
+    new Map(),
+  );
+  const pendingWsInfoRef = useRef<Map<number, any>>(new Map());
+  const wsFlushTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     loadNodes();
     initWebSocket();
 
     return () => {
+      if (wsFlushTimerRef.current != null) {
+        window.clearTimeout(wsFlushTimerRef.current);
+        wsFlushTimerRef.current = null;
+      }
       closeWebSocket();
       closeTermWS();
     };
@@ -1239,22 +1248,46 @@ export default function NodePage() {
     }
   };
 
+  const escapeTerminalHtml = (value: unknown) =>
+    String(value ?? "").replace(/[&<>"']/g, (ch) => {
+      const escapes: Record<string, string> = {
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+      };
+
+      return escapes[ch] || ch;
+    });
+
+  const sanitizeTerminalColor = (value: string | null, fallback: string) => {
+    const raw = String(value || "").trim();
+
+    return /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(raw)
+      ? raw
+      : fallback;
+  };
+
   const openTerminalWindow = (node: Node) => {
     const token = localStorage.getItem("token") || "";
     const proto = window.location.protocol === "https:" ? "wss" : "ws";
     const wsUrl = `${proto}://${window.location.host}/api/v1/node/${node.id}/terminal?token=${encodeURIComponent(token)}`;
+    const safeNodeName = escapeTerminalHtml(node.name);
+    const termBg = sanitizeTerminalColor(localStorage.getItem("term_bg"), "#151729");
+    const termFg = sanitizeTerminalColor(localStorage.getItem("term_fg"), "#209d5f");
     const html = `
 <!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>终端 - ${node.name}</title>
+  <title>终端 - ${safeNodeName}</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
   <style>
     html, body { margin:0; padding:0; width:100%; height:100%; background:#000; color:#d1d5db; font-family: monospace; }
     #layout { display:flex; width:100%; height:100%; padding:0; box-sizing:border-box; gap:6px; }
-    #term-wrap { flex: 1 1 90%; background: ${localStorage.getItem("term_bg") || "#151729"}; border-radius:6px; overflow:hidden; }
+    #term-wrap { flex: 1 1 90%; background: ${termBg}; border-radius:6px; overflow:hidden; }
     #term, .xterm { width:100% !important; height:100% !important; padding:4px; box-sizing:border-box; }
     #side { flex: 0 0 10%; min-width:200px; background:#111; color:#d1d5db; padding:10px; box-sizing:border-box; border-left:1px solid #222; font-size:12px; display:flex; flex-direction:column; gap:10px; transition: width 0.2s ease; }
     #side.hidden { display:none; }
@@ -1287,7 +1320,7 @@ export default function NodePage() {
       </div>
       <div>
         <div><strong>节点</strong></div>
-        <div>${node.name}</div>
+        <div>${safeNodeName}</div>
       </div>
       <div>
         <div><strong>资源</strong></div>
@@ -1350,8 +1383,8 @@ export default function NodePage() {
       rendererType: isMobile ? "dom" : "canvas",
       fontFamily: 'Menlo, Consolas, "Courier New", monospace',
       theme:{
-        background: "${localStorage.getItem("term_bg") || "#151729"}",
-        foreground: "${localStorage.getItem("term_fg") || "#209d5f"}"
+        background: ${JSON.stringify(termBg)},
+        foreground: ${JSON.stringify(termFg)}
       },
       scrollback:2000
     });
@@ -1771,6 +1804,119 @@ export default function NodePage() {
     navigate(`/network/${node.id}`);
   };
 
+  const parseWsSystemInfo = (messageData: any) => {
+    try {
+      if (typeof messageData === "string") {
+        return JSON.parse(messageData);
+      }
+
+      return messageData;
+    } catch {
+      return null;
+    }
+  };
+
+  const applyWsSystemInfo = (node: Node, systemInfo: any): Node => {
+    if (!systemInfo || Object.keys(systemInfo).length === 0) {
+      return node;
+    }
+
+    const currentUpload = parseInt(systemInfo.bytes_transmitted) || 0;
+    const currentDownload = parseInt(systemInfo.bytes_received) || 0;
+    const currentUptime = parseInt(systemInfo.uptime) || 0;
+
+    if (!currentUptime && node.systemInfo) {
+      return node;
+    }
+
+    let uploadSpeed = 0;
+    let downloadSpeed = 0;
+
+    if (node.systemInfo && node.systemInfo.uptime) {
+      const timeDiff = currentUptime - node.systemInfo.uptime;
+
+      if (timeDiff > 0 && timeDiff <= 10) {
+        const lastUpload = node.systemInfo.uploadTraffic || 0;
+        const lastDownload = node.systemInfo.downloadTraffic || 0;
+        const uploadDiff = currentUpload - lastUpload;
+        const downloadDiff = currentDownload - lastDownload;
+
+        if (currentUpload >= lastUpload && uploadDiff >= 0) {
+          uploadSpeed = uploadDiff / timeDiff;
+        }
+
+        if (currentDownload >= lastDownload && downloadDiff >= 0) {
+          downloadSpeed = downloadDiff / timeDiff;
+        }
+      }
+    }
+
+    return {
+      ...node,
+      connectionStatus: "online",
+      systemInfo: {
+        cpuUsage: parseFloat(systemInfo.cpu_usage) || 0,
+        memoryUsage: parseFloat(systemInfo.memory_usage) || 0,
+        uploadTraffic: currentUpload,
+        downloadTraffic: currentDownload,
+        uploadSpeed,
+        downloadSpeed,
+        uptime: currentUptime,
+        gostApi: !!systemInfo.gost_api,
+        gostRunning: !!systemInfo.gost_running,
+        gostApiConfigured:
+          systemInfo.gost_api_configured !== undefined
+            ? !!systemInfo.gost_api_configured
+            : !!systemInfo.gost_api,
+      },
+    };
+  };
+
+  const flushWsNodeUpdates = () => {
+    wsFlushTimerRef.current = null;
+    const statusMap = new Map(pendingWsStatusRef.current);
+    const infoMap = new Map(pendingWsInfoRef.current);
+
+    pendingWsStatusRef.current.clear();
+    pendingWsInfoRef.current.clear();
+
+    if (statusMap.size === 0 && infoMap.size === 0) return;
+
+    setNodeList((prev) => {
+      let changed = false;
+      const next = prev.map((node) => {
+        let out = node;
+        const status = statusMap.get(node.id);
+
+        if (status && status !== out.connectionStatus) {
+          out = {
+            ...out,
+            connectionStatus: status,
+            systemInfo: out.systemInfo,
+          };
+        }
+        if (infoMap.has(node.id)) {
+          const updated = applyWsSystemInfo(out, infoMap.get(node.id));
+
+          if (updated !== out) {
+            out = updated;
+          }
+        }
+        if (out !== node) {
+          changed = true;
+        }
+
+        return out;
+      });
+
+      return changed ? next : prev;
+    });
+  };
+
+  const scheduleWsNodeFlush = () => {
+    if (wsFlushTimerRef.current != null) return;
+    wsFlushTimerRef.current = window.setTimeout(flushWsNodeUpdates, 200);
+  };
 
   // 刷新节点服务状态（仅查询 ss）
   const refreshServices = async (node: Node) => {
@@ -1873,99 +2019,22 @@ export default function NodePage() {
   const handleWebSocketMessage = (data: any) => {
     if (suspendRealtimeRef.current) return;
     const { id, type, data: messageData } = data;
+    const nodeID = Number(id);
+
+    if (!Number.isFinite(nodeID) || nodeID <= 0) return;
 
     if (type === "status") {
-      setNodeList((prev) =>
-        prev.map((node) => {
-          if (node.id == id) {
-            return {
-              ...node,
-              connectionStatus: messageData === 1 ? "online" : "offline",
-              systemInfo: node.systemInfo,
-            };
-          }
-
-          return node;
-        }),
+      pendingWsStatusRef.current.set(
+        nodeID,
+        messageData === 1 ? "online" : "offline",
       );
+      scheduleWsNodeFlush();
     } else if (type === "info") {
-      setNodeList((prev) =>
-        prev.map((node) => {
-          if (node.id == id) {
-            try {
-              let systemInfo;
+      const systemInfo = parseWsSystemInfo(messageData);
 
-              if (typeof messageData === "string") {
-                systemInfo = JSON.parse(messageData);
-              } else {
-                systemInfo = messageData;
-              }
-              if (!systemInfo || Object.keys(systemInfo).length === 0) {
-                return node;
-              }
-
-              const currentUpload = parseInt(systemInfo.bytes_transmitted) || 0;
-              const currentDownload = parseInt(systemInfo.bytes_received) || 0;
-              const currentUptime = parseInt(systemInfo.uptime) || 0;
-
-              if (!currentUptime && node.systemInfo) {
-                return node;
-              }
-
-              let uploadSpeed = 0;
-              let downloadSpeed = 0;
-
-              if (node.systemInfo && node.systemInfo.uptime) {
-                const timeDiff = currentUptime - node.systemInfo.uptime;
-
-                if (timeDiff > 0 && timeDiff <= 10) {
-                  const lastUpload = node.systemInfo.uploadTraffic || 0;
-                  const lastDownload = node.systemInfo.downloadTraffic || 0;
-
-                  const uploadDiff = currentUpload - lastUpload;
-                  const downloadDiff = currentDownload - lastDownload;
-
-                  const uploadReset = currentUpload < lastUpload;
-                  const downloadReset = currentDownload < lastDownload;
-
-                  if (!uploadReset && uploadDiff >= 0) {
-                    uploadSpeed = uploadDiff / timeDiff;
-                  }
-
-                  if (!downloadReset && downloadDiff >= 0) {
-                    downloadSpeed = downloadDiff / timeDiff;
-                  }
-                }
-              }
-
-              return {
-                ...node,
-                connectionStatus: "online",
-                systemInfo: {
-                  cpuUsage: parseFloat(systemInfo.cpu_usage) || 0,
-                  memoryUsage: parseFloat(systemInfo.memory_usage) || 0,
-                  uploadTraffic: currentUpload,
-                  downloadTraffic: currentDownload,
-                  uploadSpeed: uploadSpeed,
-                  downloadSpeed: downloadSpeed,
-                  uptime: currentUptime,
-                  gostApi: !!systemInfo.gost_api,
-                  gostRunning: !!systemInfo.gost_running,
-                  // Prefer explicit configured flag; fallback to api reachable for agents未上报configured的旧版
-                  gostApiConfigured:
-                    systemInfo.gost_api_configured !== undefined
-                      ? !!systemInfo.gost_api_configured
-                      : !!systemInfo.gost_api,
-                },
-              };
-            } catch (error) {
-              return node;
-            }
-          }
-
-          return node;
-        }),
-      );
+      if (!systemInfo || Object.keys(systemInfo).length === 0) return;
+      pendingWsInfoRef.current.set(nodeID, systemInfo);
+      scheduleWsNodeFlush();
     }
   };
 
@@ -2596,7 +2665,7 @@ export default function NodePage() {
               className="w-full"
               estimateRowHeight={nodeRowHeight}
               items={nodeList}
-              minItemWidth={320}
+              minItemWidth={280}
               renderItem={(node) => (
                 <Card
                   key={node.id}
@@ -2795,9 +2864,28 @@ export default function NodePage() {
                               variant="flat"
                               onPress={async () => {
                                 try {
-                                  await enableGostApi(node.id);
+                                  const input = window.prompt(
+                                    "请输入 GOST API 端口（默认 18080）",
+                                    "18080",
+                                  );
+                                  if (input === null) return;
+                                  const trimmed = String(input).trim();
+                                  let port: number | undefined = undefined;
+                                  if (trimmed !== "") {
+                                    const n = Number(trimmed);
+                                    if (
+                                      !Number.isInteger(n) ||
+                                      n <= 0 ||
+                                      n > 65535
+                                    ) {
+                                      toast.error("端口需为 1-65535 的整数");
+                                      return;
+                                    }
+                                    port = n;
+                                  }
+                                  await enableGostApi(node.id, port);
                                   toast.success(
-                                    "已发送启用 GOST API 指令，稍候刷新",
+                                    "已发送启用 GOST API 指令（仅本机127.0.0.1监听），稍候刷新",
                                   );
                                 } catch (e: any) {
                                   toast.error(e?.message || "指令发送失败");
@@ -2808,14 +2896,52 @@ export default function NodePage() {
                             </Button>
                           ) : (node.systemInfo as any).gostApiConfigured ===
                             true ? (
-                            <Button
-                              color="secondary"
-                              size="sm"
-                              variant="flat"
-                              onPress={() => showGostConfig(node)}
-                            >
-                              查看 GOST 配置
-                            </Button>
+                            <>
+                              <Button
+                                color="primary"
+                                size="sm"
+                                variant="flat"
+                                onPress={async () => {
+                                  try {
+                                    const input = window.prompt(
+                                      "请输入 GOST API 端口（默认 18080）",
+                                      "18080",
+                                    );
+                                    if (input === null) return;
+                                    const trimmed = String(input).trim();
+                                    let port: number | undefined = undefined;
+                                    if (trimmed !== "") {
+                                      const n = Number(trimmed);
+                                      if (
+                                        !Number.isInteger(n) ||
+                                        n <= 0 ||
+                                        n > 65535
+                                      ) {
+                                        toast.error("端口需为 1-65535 的整数");
+                                        return;
+                                      }
+                                      port = n;
+                                    }
+                                    await enableGostApi(node.id, port);
+                                    toast.success(
+                                      "已发送重配 GOST API 指令（仅本机127.0.0.1监听），稍候刷新",
+                                    );
+                                  } catch (e: any) {
+                                    toast.error(e?.message || "指令发送失败");
+                                  }
+                                }}
+                              >
+                                API端口
+                              </Button>
+                              <Button
+                                color="secondary"
+                                size="sm"
+                                variant="flat"
+                                onPress={() => showGostConfig(node)}
+                              >
+                                查看 GOST 配置
+                              </Button>
+                            </>
                           ) : (
                             "检测中…"
                           )
@@ -2977,7 +3103,7 @@ export default function NodePage() {
 
                   {/* 操作按钮 */}
                   <div className="space-y-1.5">
-                    <div className="grid grid-cols-3 gap-1.5">
+                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5">
                       <Button
                         className="w-full min-h-8"
                         color="success"

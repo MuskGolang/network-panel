@@ -25,6 +25,43 @@ var (
 	logCaptures  = map[string]*logCaptureSession{}
 )
 
+func cleanupLogCapturesLocked(now time.Time) {
+	ttl := 15 * time.Minute
+	for k, v := range logCaptures {
+		if v == nil || now.Sub(v.startedAt) > ttl {
+			delete(logCaptures, k)
+		}
+	}
+	// hard cap to avoid unbounded growth when stop is never called
+	maxEntries := 256
+	if len(logCaptures) <= maxEntries {
+		return
+	}
+	type kv struct {
+		k string
+		t time.Time
+	}
+	arr := make([]kv, 0, len(logCaptures))
+	for k, v := range logCaptures {
+		t := now
+		if v != nil && !v.startedAt.IsZero() {
+			t = v.startedAt
+		}
+		arr = append(arr, kv{k: k, t: t})
+	}
+	// remove oldest first
+	for len(arr) > maxEntries {
+		oldest := 0
+		for i := 1; i < len(arr); i++ {
+			if arr[i].t.Before(arr[oldest].t) {
+				oldest = i
+			}
+		}
+		delete(logCaptures, arr[oldest].k)
+		arr = append(arr[:oldest], arr[oldest+1:]...)
+	}
+}
+
 func startLogCapture(reqID string, target string) map[string]any {
 	if reqID == "" {
 		return map[string]any{"success": false, "message": "missing requestId"}
@@ -59,6 +96,7 @@ func startLogCapture(reqID string, target string) map[string]any {
 		sess.mode = "none"
 	}
 	logCaptureMu.Lock()
+	cleanupLogCapturesLocked(time.Now())
 	logCaptures[reqID] = sess
 	logCaptureMu.Unlock()
 	return map[string]any{"success": true, "source": sess.mode}
@@ -69,6 +107,7 @@ func stopLogCapture(reqID string, target string) map[string]any {
 		return map[string]any{"success": false, "message": "missing requestId"}
 	}
 	logCaptureMu.Lock()
+	cleanupLogCapturesLocked(time.Now())
 	sess := logCaptures[reqID]
 	delete(logCaptures, reqID)
 	logCaptureMu.Unlock()

@@ -113,6 +113,13 @@ const CONFIG_ITEMS: ConfigItem[] = [
     type: "switch",
   },
   {
+    key: "anytls_cert_enabled",
+    label: "启用 AnyTLS 证书管理",
+    description:
+      "默认关闭。关闭时控制器不签发/下发 AnyTLS 证书，订阅会使用 skip-cert-verify=true；开启后使用控制器证书并强制校验。",
+    type: "switch",
+  },
+  {
     key: "app_name",
     label: "应用名称",
     placeholder: "请输入应用名称",
@@ -175,6 +182,7 @@ const getInitialConfigs = (): Record<string, string> => {
     "diag_local_probe_timeout_s",
     "show_probe",
     "show_network",
+    "anytls_cert_enabled",
     "registration_enabled",
   ];
   const initialConfigs: Record<string, string> = {};

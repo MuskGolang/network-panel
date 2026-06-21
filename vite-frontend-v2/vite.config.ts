@@ -1,6 +1,6 @@
 import path from "path";
 
-import { defineConfig } from "vite";
+import { defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwind from "@tailwindcss/vite";
 import compression from "vite-plugin-compression";
@@ -9,13 +9,18 @@ import compression from "vite-plugin-compression";
 // @ts-ignore
 import pkg from "./package.json";
 
-export default defineConfig({
-  plugins: [
-    tailwind(),
-    react(),
-    compression({ algorithm: "gzip" }),
-    compression({ algorithm: "brotliCompress", ext: ".br" }),
-  ],
+export default defineConfig(({ mode }) => {
+  const env = loadEnv(mode, process.cwd(), "");
+  const enablePrecompress = String(env.VITE_PRECOMPRESS || "").toLowerCase() === "true";
+  const plugins = [tailwind(), react()];
+  if (enablePrecompress) {
+    plugins.push(
+      compression({ algorithm: "gzip" }),
+      compression({ algorithm: "brotliCompress", ext: ".br" }),
+    );
+  }
+  return {
+  plugins,
   base: "/app/",
   define: {
     "import.meta.env.VITE_APP_VERSION": JSON.stringify(pkg.version || ""),
@@ -84,4 +89,5 @@ export default defineConfig({
       },
     },
   },
+  };
 });

@@ -39,6 +39,25 @@ const formatUptime = (seconds: number) => {
       : `${m}分钟`;
 };
 
+const toNum = (v: any): number | null => {
+  if (v === null || typeof v === "undefined" || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+};
+
+const formatMB = (v: any) => {
+  const n = toNum(v);
+  if (n === null) return "-";
+  return `${n.toFixed(1)} MB`;
+};
+
+const agentMemHealth = (rssMb: number | null) => {
+  if (rssMb === null) return { text: "-", cls: "bg-default-100 text-default-600" };
+  if (rssMb <= 96) return { text: "正常", cls: "bg-success-100 text-success-700" };
+  if (rssMb <= 192) return { text: "偏高", cls: "bg-warning-100 text-warning-700" };
+  return { text: "高", cls: "bg-danger-100 text-danger-700" };
+};
+
 
 const addMonths = (ts: number, months: number) => {
   const d = new Date(ts);
@@ -82,6 +101,9 @@ export default function NetworkPage() {
   const nodeId = Number(params.id);
   const [range, setRange] = useState("1h");
   const [listKey, setListKey] = useState(0);
+  const [sortMode, setSortMode] = useState<"default" | "rss_desc" | "rss_asc">(
+    "default",
+  );
   const [data, setData] = useState<any>({
     results: [],
     targets: {},
@@ -191,6 +213,21 @@ export default function NetworkPage() {
     return g;
   }, [data]);
 
+  const sortedNodes = useMemo(() => {
+    const arr = [...nodes];
+    if (sortMode === "default") return arr;
+    arr.sort((a, b) => {
+      const sa = sysMap[a.id] || {};
+      const sb = sysMap[b.id] || {};
+      const ra = toNum(sa.agentRssMb ?? sa.agent_rss_mb);
+      const rb = toNum(sb.agentRssMb ?? sb.agent_rss_mb);
+      const va = ra ?? -1;
+      const vb = rb ?? -1;
+      return sortMode === "rss_asc" ? va - vb : vb - va;
+    });
+    return arr;
+  }, [nodes, sortMode, sysMap]);
+
   useEffect(() => {
     const render = async () => {
       if (!chartRef.current) return;
@@ -299,23 +336,49 @@ export default function NetworkPage() {
           </Button>
         ))}
         {!params.id && (
-          <Button
-            size="sm"
-            variant="flat"
-            onPress={async () => {
-              const url =
-                (window.location?.origin || "") + "/app/share/network";
+          <>
+            <Button
+              color={sortMode === "default" ? "primary" : "default"}
+              size="sm"
+              variant={sortMode === "default" ? "solid" : "flat"}
+              onPress={() => setSortMode("default")}
+            >
+              默认
+            </Button>
+            <Button
+              color={sortMode === "rss_desc" ? "primary" : "default"}
+              size="sm"
+              variant={sortMode === "rss_desc" ? "solid" : "flat"}
+              onPress={() => setSortMode("rss_desc")}
+            >
+              RSS 高到低
+            </Button>
+            <Button
+              color={sortMode === "rss_asc" ? "primary" : "default"}
+              size="sm"
+              variant={sortMode === "rss_asc" ? "solid" : "flat"}
+              onPress={() => setSortMode("rss_asc")}
+            >
+              RSS 低到高
+            </Button>
+            <Button
+              size="sm"
+              variant="flat"
+              onPress={async () => {
+                const url =
+                  (window.location?.origin || "") + "/app/share/network";
 
-              try {
-                await navigator.clipboard.writeText(url);
-                toast.success("分享链接已复制");
-              } catch {
-                toast.error("复制失败：" + url);
-              }
-            }}
-          >
-            分享
-          </Button>
+                try {
+                  await navigator.clipboard.writeText(url);
+                  toast.success("分享链接已复制");
+                } catch {
+                  toast.error("复制失败：" + url);
+                }
+              }}
+            >
+              分享
+            </Button>
+          </>
         )}
       </div>
 
@@ -342,8 +405,8 @@ export default function NetworkPage() {
           <CardBody>
             <VirtualGrid
               className="w-full"
-              estimateRowHeight={220}
-              items={nodes}
+              estimateRowHeight={250}
+              items={sortedNodes}
               maxColumns={4}
               minItemWidth={260}
               renderItem={(n: any) => {
@@ -352,6 +415,11 @@ export default function NetworkPage() {
                 const latest = s.latest ?? null;
                 const sys = sysMap[n.id];
                 const online = n.status === 1;
+                const agentRss = toNum(sys?.agentRssMb ?? sys?.agent_rss_mb);
+                const agentHeap = toNum(
+                  sys?.agentHeapAllocMb ?? sys?.agent_heap_alloc_mb,
+                );
+                const memTag = agentMemHealth(agentRss);
                 const remainDays = () => {
                   const cm =
                     cycleOverride[n.id] ||
@@ -383,11 +451,16 @@ export default function NetworkPage() {
                   >
                     <div className="flex items-start justify-between mb-2">
                       <div className="font-semibold truncate">{n.name}</div>
-                      <span
-                        className={`text-2xs px-2 py-0.5 rounded ${online ? "bg-success-100 text-success-700" : "bg-danger-100 text-danger-700"}`}
-                      >
-                        {online ? "在线" : "离线"}
-                      </span>
+                      <div className="flex items-center gap-1">
+                        <span
+                          className={`text-2xs px-2 py-0.5 rounded ${online ? "bg-success-100 text-success-700" : "bg-danger-100 text-danger-700"}`}
+                        >
+                          {online ? "在线" : "离线"}
+                        </span>
+                        <span className={`text-2xs px-2 py-0.5 rounded ${memTag.cls}`}>
+                          Agent内存 {memTag.text}
+                        </span>
+                      </div>
                     </div>
                     <div className="grid grid-cols-2 gap-3 text-xs">
                       <div>
@@ -417,6 +490,14 @@ export default function NetworkPage() {
                         <div className="font-mono">
                           {avg != null ? `${avg.toFixed(1)} ms` : "-"}
                         </div>
+                      </div>
+                      <div>
+                        <div className="text-default-600 mb-0.5">Agent RSS</div>
+                        <div className="font-mono">{formatMB(agentRss)}</div>
+                      </div>
+                      <div>
+                        <div className="text-default-600 mb-0.5">Agent Heap</div>
+                        <div className="font-mono">{formatMB(agentHeap)}</div>
                       </div>
                     </div>
 

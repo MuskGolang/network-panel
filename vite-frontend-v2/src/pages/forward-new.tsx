@@ -34,7 +34,6 @@ import {
   getForwardStatusDetail,
   getNodeInterfaces,
   getNodeList,
-  setExitNode,
   getTunnelBind,
   getTunnelById,
   getTunnelPath,
@@ -53,12 +52,23 @@ type RouteItem = {
   protocol?: string;
   bindIp?: string;
   exitIp?: string;
+  egresses?: RouteEgress[];
   port?: number | null;
   ssPort?: number;
   anytlsPort?: number;
+  anytlsPorts?: Array<{ port: number; exitIp?: string }>;
   exitPort?: number;
   label: string;
   subLabel?: string;
+};
+type RouteEgress = {
+  ip: string;
+  suffix: string;
+};
+
+type AnyTLSPortMapping = {
+  port: number;
+  exitIp?: string;
 };
 type LinkMode = "direct" | "tunnel";
 
@@ -133,6 +143,47 @@ const SortableRouteItem = ({
       </Button>
     </div>
   );
+};
+
+const normalizeRouteEgressPayload = (raw: any): RouteEgress[] => {
+  if (!Array.isArray(raw)) return [];
+  const out: RouteEgress[] = [];
+  const seen = new Set<string>();
+  raw.forEach((it: any) => {
+    const ip = String(it?.ip || "").trim();
+    const suffix = String(it?.suffix || "").trim();
+    if (!ip) return;
+    const key = `${ip}\u0000${suffix}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ ip, suffix });
+  });
+  return out;
+};
+
+const normalizeAnyTLSPorts = (raw: any): AnyTLSPortMapping[] => {
+  if (!Array.isArray(raw)) return [];
+  const out: AnyTLSPortMapping[] = [];
+  const seen = new Set<number>();
+  raw.forEach((it: any) => {
+    const p = Number(it?.port || 0);
+    if (p <= 0 || seen.has(p)) return;
+    seen.add(p);
+    out.push({
+      port: p,
+      exitIp: String(it?.exitIp || ""),
+    });
+  });
+  return out.sort((a, b) => a.port - b.port);
+};
+
+const findAnyTLSPortExitIp = (
+  list: AnyTLSPortMapping[] | undefined,
+  port: number,
+): string => {
+  if (!Array.isArray(list) || port <= 0) return "";
+  const hit = list.find((it) => Number(it?.port || 0) === port);
+  return hit?.exitIp ? String(hit.exitIp) : "";
 };
 
 export default function ForwardNewPage() {
@@ -299,6 +350,14 @@ export default function ForwardNewPage() {
           const ssData = ssRes && ssRes.code === 0 ? ssRes.data : null;
           const anyData = anyRes && anyRes.code === 0 ? anyRes.data : null;
           if (!ssData && !anyData) continue;
+          const anytlsPorts = normalizeAnyTLSPorts(anyData?.anytlsPorts);
+          const fallbackPort = Number(anyData?.port || 0);
+          const mergedAnyTLSPorts =
+            anytlsPorts.length > 0
+              ? anytlsPorts
+              : fallbackPort > 0
+                ? [{ port: fallbackPort, exitIp: String(anyData?.exitIp || "") }]
+                : [];
           results.push({
             source: "node",
             nodeId,
@@ -306,7 +365,8 @@ export default function ForwardNewPage() {
             host: node?.serverIp || node?.ip || "",
             online: node?.status === 1,
             ssPort: ssData?.port,
-            anytlsPort: anyData?.port,
+            anytlsPort: mergedAnyTLSPorts[0]?.port,
+            anytlsPorts: mergedAnyTLSPorts,
             anytlsPassword: anyData?.password,
             anytlsExitIp: anyData?.exitIp,
           });
@@ -384,7 +444,7 @@ export default function ForwardNewPage() {
     [nodes],
   );
 
-  const buildNodeRouteItem = useCallback((node: any, protocol?: string, port?: number | null, exitIp?: string) => {
+  const buildNodeRouteItem = useCallback((node: any, protocol?: string, port?: number | null, exitIp?: string, egresses?: RouteEgress[]) => {
     const nodeId = Number(node?.id || 0);
     return {
       id: `node-${nodeId}`,
@@ -393,6 +453,7 @@ export default function ForwardNewPage() {
       protocol,
       port: port ?? null,
       exitIp,
+      egresses,
       label: node?.name || `节点${nodeId}`,
       subLabel: node?.serverIp || node?.ip || "",
     } as RouteItem;
@@ -493,8 +554,11 @@ export default function ForwardNewPage() {
       );
 
       const exitProtocol = tunnel?.protocol
-        ? String(tunnel.protocol).toLowerCase()
+        ? String(tunnel.protocol).trim().toLowerCase()
         : undefined;
+      const forwardEgresses = normalizeRouteEgressPayload(
+        (forward as any)?.egresses,
+      );
       let exitItem: RouteItem | null = null;
       if (tunnel?.outExitId) {
         const ext = (exitNodes || []).find(
@@ -515,18 +579,58 @@ export default function ForwardNewPage() {
             Number(x?.nodeId || 0) === Number(tunnel.outNodeId),
         );
         if (outNode) {
+          const fallbackExitIp = String(tunnel?.outIp || "").trim();
+          const configuredEgresses =
+            forwardEgresses.length > 0
+              ? forwardEgresses
+              : fallbackExitIp
+                ? [{ ip: fallbackExitIp, suffix: "" }]
+                : [];
+          const anytlsPorts = normalizeAnyTLSPorts(exitInfo?.anytlsPorts);
+          const mergedAnyTLSPorts =
+            anytlsPorts.length > 0
+              ? anytlsPorts
+              : exitInfo?.anytlsPort
+                ? [
+                    {
+                      port: Number(exitInfo.anytlsPort),
+                      exitIp: String(exitInfo?.anytlsExitIp || ""),
+                    },
+                  ]
+                : [];
+          const requestedAnyTLSPort =
+            Number((forward as any)?.outPort || 0) ||
+            Number(exitInfo?.anytlsPort || 0) ||
+            0;
+          const selectedAnyTLSPort =
+            requestedAnyTLSPort > 0 &&
+            mergedAnyTLSPorts.some((it) => it.port === requestedAnyTLSPort)
+              ? requestedAnyTLSPort
+              : mergedAnyTLSPorts[0]?.port || requestedAnyTLSPort || 0;
+          const selectedAnyTLSExitIp = findAnyTLSPortExitIp(
+            mergedAnyTLSPorts,
+            selectedAnyTLSPort,
+          );
           exitItem = {
-            ...buildNodeRouteItem(
-              outNode,
-              exitProtocol,
-              undefined,
-              exitProtocol === "anytls" ? exitInfo?.anytlsExitIp : undefined,
-            ),
+              ...buildNodeRouteItem(
+                outNode,
+                exitProtocol,
+                undefined,
+                exitProtocol === "anytls"
+                  ? selectedAnyTLSExitIp ||
+                      configuredEgresses[0]?.ip ||
+                      fallbackExitIp
+                  : undefined,
+                exitProtocol === "anytls" ? configuredEgresses : undefined,
+              ),
             ssPort: exitInfo?.ssPort,
-            anytlsPort: exitInfo?.anytlsPort,
+            anytlsPort: selectedAnyTLSPort || undefined,
+            anytlsPorts: mergedAnyTLSPorts,
           };
           const exitPort =
-            exitProtocol === "anytls" ? exitItem.anytlsPort : exitItem.ssPort;
+            exitProtocol === "anytls"
+              ? selectedAnyTLSPort || exitItem.anytlsPort
+              : exitItem.ssPort;
           exitItem.port = exitPort != null ? Number(exitPort) : null;
         }
       }
@@ -664,8 +768,28 @@ export default function ForwardNewPage() {
           serverIp: item?.host,
         };
       setRouteItems((prev) => {
+        const anytlsPorts = normalizeAnyTLSPorts(item?.anytlsPorts);
+        const mergedAnyTLSPorts =
+          anytlsPorts.length > 0
+            ? anytlsPorts
+            : item?.anytlsPort
+              ? [
+                  {
+                    port: Number(item.anytlsPort),
+                    exitIp: String(item?.anytlsExitIp || ""),
+                  },
+                ]
+              : [];
+        const selectedAnyTLSPort =
+          mergedAnyTLSPorts.length > 0
+            ? mergedAnyTLSPorts[0].port
+            : Number(item?.anytlsPort || 0);
+        const selectedAnyTLSExitIP = findAnyTLSPortExitIp(
+          mergedAnyTLSPorts,
+          selectedAnyTLSPort,
+        );
         const exitPort =
-          protocol === "anytls" ? item?.anytlsPort : item?.ssPort;
+          protocol === "anytls" ? selectedAnyTLSPort : item?.ssPort;
         const baseItem = isExternal
           ? buildExternalRouteItem(item, protocol || item?.protocol)
           : {
@@ -673,10 +797,14 @@ export default function ForwardNewPage() {
                 nodeRef,
                 protocol,
                 undefined,
-                protocol === "anytls" ? item?.anytlsExitIp : undefined,
+                protocol === "anytls" ? selectedAnyTLSExitIP : undefined,
+                protocol === "anytls" && selectedAnyTLSExitIP
+                  ? [{ ip: selectedAnyTLSExitIP, suffix: "" }]
+                  : undefined,
               ),
               ssPort: item?.ssPort,
-              anytlsPort: item?.anytlsPort,
+              anytlsPort: selectedAnyTLSPort || undefined,
+              anytlsPorts: mergedAnyTLSPorts,
             };
         if (!baseItem.id) return prev;
         let next = prev.filter((i) => i.id !== baseItem.id);
@@ -720,8 +848,18 @@ export default function ForwardNewPage() {
         if (item.type !== "node") return item;
         const isEntry = idx === 0;
         if (idx === lastIndex && isExitItem(item) && (!isEntry || prev.length === 1)) {
-          const desired =
+          let desired =
             item.protocol === "anytls" ? item.anytlsPort : item.ssPort;
+          if (item.protocol === "anytls") {
+            const allowed = Array.isArray(item.anytlsPorts)
+              ? item.anytlsPorts.map((it) => Number(it?.port || 0)).filter((p) => p > 0)
+              : [];
+            if (item.port != null && allowed.includes(Number(item.port))) {
+              desired = Number(item.port);
+            } else if (!desired && allowed.length > 0) {
+              desired = allowed[0];
+            }
+          }
           if (desired && item.port !== desired) {
             changed = true;
             return { ...item, port: desired };
@@ -774,6 +912,27 @@ export default function ForwardNewPage() {
       }
     },
     [ifaceLoading, ifaceMap, nodes],
+  );
+
+  const buildIpOptions = useCallback(
+    (nodeId?: number, current?: string) => {
+      const opts: Array<{ key: string; label: string }> = [
+        { key: "__auto__", label: "自动选择" },
+      ];
+      const seen = new Set<string>(["__auto__"]);
+      (ifaceMap[nodeId || 0] || []).forEach((ip) => {
+        const v = String(ip || "").trim();
+        if (!v || seen.has(v)) return;
+        seen.add(v);
+        opts.push({ key: v, label: v });
+      });
+      const cur = String(current || "").trim();
+      if (cur && !seen.has(cur)) {
+        opts.push({ key: cur, label: cur });
+      }
+      return opts;
+    },
+    [ifaceMap],
   );
 
 
@@ -858,6 +1017,48 @@ export default function ForwardNewPage() {
       return;
     }
     const last = routeItems[routeItems.length - 1];
+    const lastProtocol = String(last?.protocol || "").trim().toLowerCase();
+    const selectedAnyTLSOutPort =
+      last?.type === "node" && lastProtocol === "anytls"
+        ? Number(last?.port || last?.anytlsPort || 0)
+        : 0;
+    const allowedAnyTLSPorts =
+      last?.type === "node" && lastProtocol === "anytls"
+        ? normalizeAnyTLSPorts(last?.anytlsPorts).map((it) => it.port)
+        : [];
+    const selectedExitIp =
+      last?.type === "node" && lastProtocol === "anytls"
+        ? findAnyTLSPortExitIp(last?.anytlsPorts, selectedAnyTLSOutPort) ||
+          String(last?.exitIp || "").trim()
+        : String(last?.exitIp || "").trim();
+    if (last?.type === "node" && lastProtocol === "anytls" && !selectedAnyTLSOutPort) {
+      toast.error("请选择有效的 AnyTLS 出口端口");
+      return;
+    }
+    if (
+      last?.type === "node" &&
+      lastProtocol === "anytls" &&
+      allowedAnyTLSPorts.length > 0 &&
+      !allowedAnyTLSPorts.includes(selectedAnyTLSOutPort)
+    ) {
+      toast.error("所选 AnyTLS 端口未在出口设置中配置");
+      return;
+    }
+    let forwardEgressesPayload: Array<{ ip: string; suffix: string }> = [];
+    if (last?.type === "node" && lastProtocol === "anytls") {
+      if (selectedExitIp) {
+        forwardEgressesPayload = [{ ip: selectedExitIp, suffix: "" }];
+      }
+    }
+    const shouldCarryOutIp =
+      last?.type === "node" &&
+      lastProtocol !== "anytls" &&
+      selectedExitIp !== "";
+    const nextTunnelOutIp = shouldCarryOutIp ? selectedExitIp : "";
+    const nextForwardOutPort =
+      last?.type === "node" && lastProtocol === "anytls" && selectedAnyTLSOutPort > 0
+        ? selectedAnyTLSOutPort
+        : undefined;
     let processedRemoteAddr = "";
     if (last?.type === "external") {
       const host =
@@ -877,7 +1078,9 @@ export default function ForwardNewPage() {
         node?.serverIp ||
         (node?.ip ? String(node.ip).split(",")[0].trim() : "");
       const port =
-        last.protocol === "anytls" ? last.anytlsPort : last.ssPort;
+        last.protocol === "anytls"
+          ? selectedAnyTLSOutPort
+          : last.ssPort;
       if (!host || !port) {
         toast.error("出口节点地址或协议端口无效");
         return;
@@ -889,41 +1092,6 @@ export default function ForwardNewPage() {
       return;
     }
     setPortErrors({});
-    if (
-      last?.type === "node" &&
-        last?.protocol === "anytls" &&
-        last?.exitIp !== undefined
-    ) {
-      const exitNodeId = Number(last.nodeId || 0);
-      const cached = exitNodes.find(
-        (x: any) =>
-          x?.source === "node" && Number(x?.nodeId || 0) === exitNodeId,
-      );
-      let anyPort = cached?.anytlsPort;
-      let anyPass = cached?.anytlsPassword;
-      if (!anyPort || !anyPass) {
-        const anyRes: any = await getExitNode(exitNodeId, "anytls").catch(
-          () => null,
-        );
-        if (anyRes && anyRes.code === 0 && anyRes.data) {
-          anyPort = anyRes.data?.port;
-          anyPass = anyRes.data?.password;
-        }
-      }
-      if (anyPort && anyPass) {
-        const exitRes: any = await setExitNode({
-          nodeId: exitNodeId,
-          type: "anytls",
-          port: Number(anyPort),
-          password: String(anyPass),
-          exitIp: last.exitIp == null ? "" : String(last.exitIp),
-        }).catch(() => null);
-        if (!exitRes || exitRes.code !== 0) {
-          toast.error(exitRes?.msg || "AnyTLS 出口IP设置失败");
-          return;
-        }
-      }
-    }
     const entryPort =
       routeItems[0]?.port ?? getRecommendedPort(routeItems[0]?.nodeId);
     const directExitPort =
@@ -1030,8 +1198,9 @@ export default function ForwardNewPage() {
           Number(editTunnel?.outExitId || 0) !== nextOutExitId ||
           Number(editTunnel?.outNodeId || 0) !== nextOutNodeId;
         const protoChanged =
-          String(editTunnel?.protocol || "").toLowerCase() !==
-          String(last?.protocol || "").toLowerCase();
+          String(editTunnel?.protocol || "").toLowerCase() !== lastProtocol;
+        const prevTunnelOutIp = String(editTunnel?.outIp || "").trim();
+        const outIpChanged = prevTunnelOutIp !== nextTunnelOutIp;
 
         if (entryChanged || typeChanged) {
           const tunnelName = `线路-${forwardName}-${Date.now()
@@ -1051,6 +1220,9 @@ export default function ForwardNewPage() {
           }
           if (last?.protocol) {
             tunnelPayload.protocol = last.protocol;
+          }
+          if (last?.type === "node" && shouldCarryOutIp) {
+            tunnelPayload.outIp = nextTunnelOutIp;
           }
           const tunnelRes: any = await createTunnel(tunnelPayload);
           if (!tunnelRes || tunnelRes.code !== 0) {
@@ -1074,7 +1246,7 @@ export default function ForwardNewPage() {
           }
         } else {
           tunnelId = Number(editTunnel.id);
-          if (exitChanged || protoChanged) {
+          if (exitChanged || protoChanged || outIpChanged) {
             const updatePayload: any = {
               id: Number(editTunnel.id),
               name: String(editTunnel.name || ""),
@@ -1088,6 +1260,9 @@ export default function ForwardNewPage() {
               interfaceName: editTunnel.interfaceName,
               protocol: last?.protocol,
             };
+            if (outIpChanged) {
+              updatePayload.outIp = nextTunnelOutIp;
+            }
             if (last?.type === "external") {
               updatePayload.outExitId = nextOutExitId || null;
             } else if (last?.type === "node") {
@@ -1130,9 +1305,11 @@ export default function ForwardNewPage() {
           group: groupValue,
           tunnelId,
           inPort: entryPort != null ? entryPort : undefined,
+          outPort: nextForwardOutPort,
           remoteAddr: processedRemoteAddr,
           interfaceName: editForward.interfaceName || entryBind,
           strategy: "fifo",
+          egresses: forwardEgressesPayload,
         };
         if (midPorts.length > 0) {
           updatePayload.midPorts = midPorts;
@@ -1164,6 +1341,9 @@ export default function ForwardNewPage() {
       }
       if (last?.protocol) {
         tunnelPayload.protocol = last.protocol;
+      }
+      if (last?.type === "node" && shouldCarryOutIp) {
+        tunnelPayload.outIp = nextTunnelOutIp;
       }
 
       const tunnelRes: any = await createTunnel(tunnelPayload);
@@ -1215,9 +1395,11 @@ export default function ForwardNewPage() {
         group: groupValue,
         tunnelId,
         inPort: entryPort != null ? entryPort : undefined,
+        outPort: nextForwardOutPort,
         remoteAddr: processedRemoteAddr,
         interfaceName: entryBind,
         strategy: "fifo",
+        egresses: forwardEgressesPayload,
       });
       if (!createRes || createRes.code !== 0) {
         toast.error(createRes?.msg || "转发创建失败");
@@ -1255,9 +1437,11 @@ export default function ForwardNewPage() {
               group: groupValue,
               tunnelId,
               inPort: entryPort != null ? entryPort : undefined,
+              outPort: nextForwardOutPort,
               remoteAddr: processedRemoteAddr,
               interfaceName: entryBind,
               strategy: "fifo",
+              egresses: forwardEgressesPayload,
             };
             if (midPorts.length > 0) {
               updatePayload.midPorts = midPorts;
@@ -1514,9 +1698,29 @@ export default function ForwardNewPage() {
                             const isExitCandidate = isExitItem(item);
                             const isExit = isLast && isExitCandidate;
                             const isEntry = index === 0;
-                            const lockExitPort = isExit && !isEntry;
-                            const portLabel =
-                              isEntry || isExit ? "入口端口" : "中继端口";
+                            const anytlsPortMappings = normalizeAnyTLSPorts(
+                              item.anytlsPorts,
+                            );
+                            const selectedAnyTLSPort =
+                              item.protocol === "anytls"
+                                ? Number(item.port || item.anytlsPort || 0)
+                                : 0;
+                            const selectedAnyTLSExitIp =
+                              findAnyTLSPortExitIp(
+                                anytlsPortMappings,
+                                selectedAnyTLSPort,
+                              ) || String(item.exitIp || "");
+                            const hasAnyTLSSelectablePort =
+                              isExitCandidate &&
+                              item.protocol === "anytls" &&
+                              anytlsPortMappings.length > 0;
+                            const lockExitPort =
+                              isExit && !isEntry && item.protocol !== "anytls";
+                            const portLabel = hasAnyTLSSelectablePort
+                              ? "AnyTLS出口端口"
+                              : isEntry || isExit
+                                ? "入口端口"
+                                : "中继端口";
                             const extraLines: string[] = [];
                             if (isEntry && item.type === "node") {
                               extraLines.push(
@@ -1526,17 +1730,21 @@ export default function ForwardNewPage() {
                             if (isExitCandidate && item.type === "node") {
                               const selectedExitPort =
                                 item.protocol === "anytls"
-                                  ? item.anytlsPort
+                                  ? selectedAnyTLSPort || item.anytlsPort
                                   : item.ssPort;
                               extraLines.push(
                                 `SS出口：${item.ssPort != null ? item.ssPort : "-"}`,
                               );
                               extraLines.push(
-                                `AnyTLS出口：${item.anytlsPort != null ? item.anytlsPort : "-"}`,
+                                `AnyTLS出口：${
+                                  selectedAnyTLSPort || item.anytlsPort
+                                    ? selectedAnyTLSPort || item.anytlsPort
+                                    : "-"
+                                }`,
                               );
                               if (item.protocol === "anytls") {
                                 extraLines.push(
-                                  `AnyTLS出口IP：${item.exitIp || "-"}`,
+                                  `AnyTLS出口IP：${selectedAnyTLSExitIp || "-"}`,
                                 );
                               }
                               if (!isEntry && isExit) {
@@ -1574,103 +1782,16 @@ export default function ForwardNewPage() {
                                       </div>
                                     ) : (
                                       (() => {
-                                      const opts = [
-                                        { key: "__auto__", label: "自动选择" },
-                                        ...(
-                                          ifaceMap[item.nodeId || 0] || []
-                                        ).map((ip) => ({
-                                          key: ip,
-                                          label: ip,
-                                        })),
-                                      ];
-                                      return (
-                                        <Select
-                                          label="入口IP"
-                                          placeholder="请选择入口IP"
-                                          selectedKeys={
-                                            item.bindIp ? [item.bindIp] : []
-                                          }
-                                          size="sm"
-                                          variant="bordered"
-                                          onOpenChange={(open) => {
-                                            if (open) loadIfaces(item.nodeId);
-                                          }}
-                                          onSelectionChange={(keys) => {
-                                            const k = Array.from(keys)[0] as string;
-                                            updateRouteItem(item.id, {
-                                              bindIp: k === "__auto__" ? undefined : k,
-                                            });
-                                          }}
-                                          items={opts}
-                                        >
-                                          {(opt) => (
-                                            <SelectItem key={opt.key}>
-                                              {opt.label}
-                                            </SelectItem>
-                                          )}
-                                        </Select>
-                                      );
-                                    })()
-                                    )}
-                                    <Input
-                                      label={portLabel}
-                                      placeholder={
-                                        lockExitPort
-                                          ? item.protocol === "anytls"
-                                            ? item.anytlsPort
-                                              ? "出口端口已锁定"
-                                              : "出口端口未配置"
-                                            : item.ssPort
-                                              ? "出口端口已锁定"
-                                              : "出口端口未配置"
-                                          : recommendedEntryPort
-                                            ? `推荐 ${recommendedEntryPort}`
-                                            : "留空自动分配"
-                                      }
-                                      size="sm"
-                                      type="number"
-                                      value={
-                                        lockExitPort
-                                          ? String(
-                                              item.protocol === "anytls"
-                                                ? item.anytlsPort || ""
-                                                : item.ssPort || "",
-                                            )
-                                          : item.port != null
-                                            ? String(item.port)
-                                            : recommendedEntryPort != null
-                                              ? String(recommendedEntryPort)
-                                              : ""
-                                      }
-                                      variant="bordered"
-                                      isInvalid={!!portErrors[item.id]}
-                                      errorMessage={portErrors[item.id]}
-                                      isDisabled={lockExitPort}
-                                      onChange={(e) => {
-                                        if (lockExitPort) return;
-                                        const v = e.target.value;
-                                        updateRouteItem(item.id, {
-                                          port: v ? Number(v) : null,
-                                        });
-                                      }}
-                                    />
-                                    {isExit && item.protocol === "anytls" ? (
-                                      (() => {
-                                        const opts = [
-                                          { key: "__auto__", label: "自动选择" },
-                                          ...(
-                                            ifaceMap[item.nodeId || 0] || []
-                                          ).map((ip) => ({
-                                            key: ip,
-                                            label: ip,
-                                          })),
-                                        ];
+                                        const opts = buildIpOptions(
+                                          item.nodeId,
+                                          item.bindIp,
+                                        );
                                         return (
                                           <Select
-                                            label="AnyTLS出口IP"
-                                            placeholder="请选择出口IP"
+                                            label="入口IP"
+                                            placeholder="请选择入口IP"
                                             selectedKeys={
-                                              item.exitIp ? [item.exitIp] : []
+                                              item.bindIp ? [item.bindIp] : []
                                             }
                                             size="sm"
                                             variant="bordered"
@@ -1680,7 +1801,7 @@ export default function ForwardNewPage() {
                                             onSelectionChange={(keys) => {
                                               const k = Array.from(keys)[0] as string;
                                               updateRouteItem(item.id, {
-                                                exitIp: k === "__auto__" ? "" : k,
+                                                bindIp: k === "__auto__" ? undefined : k,
                                               });
                                             }}
                                             items={opts}
@@ -1693,6 +1814,85 @@ export default function ForwardNewPage() {
                                           </Select>
                                         );
                                       })()
+                                    )}
+                                    {hasAnyTLSSelectablePort ? (
+                                      <Select
+                                        label={portLabel}
+                                        placeholder="请选择AnyTLS端口"
+                                        size="sm"
+                                        variant="bordered"
+                                        selectedKeys={
+                                          selectedAnyTLSPort > 0
+                                            ? [String(selectedAnyTLSPort)]
+                                            : []
+                                        }
+                                        isInvalid={!!portErrors[item.id]}
+                                        errorMessage={portErrors[item.id]}
+                                        onSelectionChange={(keys) => {
+                                          const key = Array.from(keys)[0] as string;
+                                          const p = Number(key || 0);
+                                          const mappedExitIp = findAnyTLSPortExitIp(
+                                            anytlsPortMappings,
+                                            p,
+                                          );
+                                          updateRouteItem(item.id, {
+                                            port: p > 0 ? p : null,
+                                            anytlsPort: p > 0 ? p : undefined,
+                                            exitIp: mappedExitIp || undefined,
+                                            egresses: mappedExitIp
+                                              ? [{ ip: mappedExitIp, suffix: "" }]
+                                              : [],
+                                          });
+                                        }}
+                                      >
+                                        {anytlsPortMappings.map((it) => (
+                                          <SelectItem key={String(it.port)}>
+                                            {it.port}
+                                            {it.exitIp ? ` · ${it.exitIp}` : ""}
+                                          </SelectItem>
+                                        ))}
+                                      </Select>
+                                    ) : (
+                                      <Input
+                                        label={portLabel}
+                                        placeholder={
+                                          lockExitPort
+                                            ? item.ssPort
+                                              ? "出口端口已锁定"
+                                              : "出口端口未配置"
+                                            : recommendedEntryPort
+                                              ? `推荐 ${recommendedEntryPort}`
+                                              : "留空自动分配"
+                                        }
+                                        size="sm"
+                                        type="number"
+                                        value={
+                                          lockExitPort
+                                            ? String(item.ssPort || "")
+                                            : item.port != null
+                                              ? String(item.port)
+                                              : recommendedEntryPort != null
+                                                ? String(recommendedEntryPort)
+                                                : ""
+                                        }
+                                        variant="bordered"
+                                        isInvalid={!!portErrors[item.id]}
+                                        errorMessage={portErrors[item.id]}
+                                        isDisabled={lockExitPort}
+                                        onChange={(e) => {
+                                          if (lockExitPort) return;
+                                          const v = e.target.value;
+                                          updateRouteItem(item.id, {
+                                            port: v ? Number(v) : null,
+                                          });
+                                        }}
+                                      />
+                                    )}
+                                    {isExit && item.protocol === "anytls" ? (
+                                      <div className="col-span-2 text-2xs text-default-500">
+                                        当前端口映射出口IP：
+                                        {selectedAnyTLSExitIp || "-"}
+                                      </div>
                                     ) : null}
                                     {ifaceLoading[item.nodeId || 0] ? (
                                       <div className="text-2xs text-default-400">
@@ -1777,7 +1977,9 @@ export default function ForwardNewPage() {
                     <>
                       {exitNodeList.map((item: any) => {
                         const hasSS = !!item?.ssPort;
-                        const hasAnyTLS = !!item?.anytlsPort;
+                        const anytlsPorts = normalizeAnyTLSPorts(item?.anytlsPorts);
+                        const hasAnyTLS =
+                          anytlsPorts.length > 0 || !!item?.anytlsPort;
                         const isOnline = item?.online !== false;
                         return (
                         <div
@@ -1794,7 +1996,12 @@ export default function ForwardNewPage() {
                             SS出口：{item?.ssPort ? item.ssPort : "-"}
                           </div>
                           <div className="text-2xs text-default-600">
-                            AnyTLS出口：{item?.anytlsPort ? item.anytlsPort : "-"}
+                            AnyTLS出口：
+                            {anytlsPorts.length > 0
+                              ? anytlsPorts.map((it) => it.port).join(", ")
+                              : item?.anytlsPort
+                                ? item.anytlsPort
+                                : "-"}
                           </div>
                           <div className="flex flex-wrap gap-2 pt-1">
                             {hasSS && hasAnyTLS ? (

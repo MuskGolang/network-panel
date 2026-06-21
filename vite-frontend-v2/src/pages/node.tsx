@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback, memo } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { Card, CardBody, CardHeader } from "@heroui/card";
 import { Button } from "@heroui/button";
 import { Input } from "@heroui/input";
@@ -39,6 +39,9 @@ import {
   nodeSelfCheck,
   setExitNode,
   getExitNode,
+  getAnyTLSCertPreview,
+  checkAnyTLSCertChain,
+  reissueAnyTLSCert,
   restartGost,
   agentReconcileNode,
   enableGostApi,
@@ -48,8 +51,13 @@ import {
   nodeDiagStart,
   nodeDiagResult,
   nodeIperf3Status,
+  nodePprofControl,
+  nodePprofFetch,
   listNodeOps,
+  listNodeAnyTLSCertLogs,
+  listNodeAnyTLSRuntimeLogs,
   getNodeUserUsage,
+  upgradeNodeAgentsBatch,
 } from "@/api";
 
 interface Node {
@@ -79,11 +87,92 @@ interface Node {
     gostApi?: boolean;
     gostRunning?: boolean;
     gostApiConfigured?: boolean;
+    agentHeapAllocMb?: number;
+    agentHeapInuseMb?: number;
+    agentStackInuseMb?: number;
+    agentSysMb?: number;
+    agentRssMb?: number;
+    agentNumGc?: number;
+    agentLastGcPauseMs?: number;
+    agentGcCpuPercent?: number;
+    agentGoRoutines?: number;
+    agentMemCollectedAtMs?: number;
   } | null;
   copyLoading?: boolean;
   ssStatus?: string;
   ssLoading?: boolean;
+  anytlsPort?: number;
+  anytlsPorts?: Array<{ port: number; exitIp?: string }>;
+  anytlsCert?: {
+    domain?: string;
+    notBeforeMs?: number;
+    notAfterMs?: number;
+    daysLeft?: number;
+    state?: "ok" | "expiring" | "expired" | string;
+    updatedAtMs?: number;
+    source?: "agent_log" | "controller_estimate" | string;
+  } | null;
+  anytlsRuntime?: {
+    state?: "healthy" | "degraded" | "unknown" | string;
+    windowSec?: number;
+    recentCount?: number;
+    starts?: number;
+    acceptErr?: number;
+    connReject?: number;
+    handshakeTimeout?: number;
+    tlsClientHello?: number;
+    tlsHandshakeErr?: number;
+    tlsConnResetByPeer?: number;
+    tlsSniMismatch?: number;
+    listenErr?: number;
+    streamErr?: number;
+    authFail?: number;
+    readErr?: number;
+    outboundErr?: number;
+    egressDialErr?: number;
+    lastLogMs?: number;
+  } | null;
+  gostApiBindLoopbackOnly?: boolean;
+  gostApiBindDetail?: string;
+  gostApiBindCheckedAtMs?: number;
 }
+
+type AnyTLSRuntimeLogItem = {
+  id: number;
+  timeMs: number;
+  nodeId: number;
+  cmd: string;
+  requestId?: string;
+  success: number;
+  message: string;
+  stdout?: string;
+  stderr?: string;
+};
+
+type AnyTLSRuntimeStatus = {
+  state: "healthy" | "degraded" | "unknown" | string;
+  windowSec: number;
+  windowFromMs: number;
+  windowToMs: number;
+  recentCount: number;
+  totalLogs: number;
+  starts: number;
+  acceptErr: number;
+  connReject: number;
+  handshakeTimeout: number;
+  tlsClientHello: number;
+  tlsHandshakeErr: number;
+  tlsConnResetByPeer: number;
+  tlsSniMismatch: number;
+  listenErr: number;
+  streamErr: number;
+  authFail: number;
+  readErr: number;
+  outboundErr: number;
+  egressDialErr: number;
+  lastLogMs: number;
+  lastStartMs: number;
+};
 
 interface NodeForm {
   id: number | null;
@@ -93,6 +182,91 @@ interface NodeForm {
   portSta: number;
   portEnd: number;
 }
+
+const nodeHasAnyTLS = (node?: Node | null) => {
+  if (!node) return false;
+  if ((node.anytlsPort || 0) > 0) return true;
+  return Array.isArray(node.anytlsPorts) && node.anytlsPorts.length > 0;
+};
+
+type PprofProfile =
+  | "goroutine"
+  | "heap"
+  | "mutex"
+  | "block"
+  | "threadcreate";
+
+type GoroutineSnapshot = {
+  total: number;
+  anytlsStacks: number;
+  copyConn: number;
+  copyPacketConn: number;
+  copyStream: number;
+  copyPacket: number;
+  sessionRecv: number;
+};
+
+type HeapSnapshot = {
+  heapAlloc: number;
+  heapInuse: number;
+  heapObjects: number;
+  numGC: number;
+  maxRSS: number;
+};
+
+const sleepMs = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const toMB = (v: number) => (v > 0 ? (v / 1024 / 1024).toFixed(2) : "0.00");
+
+const parseFirstInt = (text: string, re: RegExp): number => {
+  const m = text.match(re);
+
+  return m?.[1] ? Number(m[1]) || 0 : 0;
+};
+
+const parseGoroutineSnapshot = (content: string): GoroutineSnapshot => {
+  const lines = String(content || "").split(/\r?\n/);
+  const out: GoroutineSnapshot = {
+    total: parseFirstInt(content, /goroutine profile:\s*total\s+(\d+)/i),
+    anytlsStacks: 0,
+    copyConn: 0,
+    copyPacketConn: 0,
+    copyStream: 0,
+    copyPacket: 0,
+    sessionRecv: 0,
+  };
+  let curCount = 0;
+  let curBody = "";
+  const flush = () => {
+    if (curCount <= 0 || !curBody) return;
+    if (curBody.includes("cmd/flux-agent/anytls.go")) out.anytlsStacks += curCount;
+    if (curBody.includes("copyConnWithLimiter")) out.copyConn += curCount;
+    if (curBody.includes("copyPacketConnWithLimiter")) out.copyPacketConn += curCount;
+    if (curBody.includes("copyStreamLimited")) out.copyStream += curCount;
+    if (curBody.includes("copyPacketLimited")) out.copyPacket += curCount;
+    if (curBody.includes("session.(*Session).recvLoop")) out.sessionRecv += curCount;
+  };
+  for (const line of lines) {
+    const m = line.match(/^(\d+)\s+@/);
+    if (m) {
+      flush();
+      curCount = Number(m[1]) || 0;
+      curBody = "";
+      continue;
+    }
+    if (line.startsWith("#")) curBody += line + "\n";
+  }
+  flush();
+  return out;
+};
+
+const parseHeapSnapshot = (content: string): HeapSnapshot => ({
+  heapAlloc: parseFirstInt(content, /#\s*HeapAlloc\s*=\s*(\d+)/),
+  heapInuse: parseFirstInt(content, /#\s*HeapInuse\s*=\s*(\d+)/),
+  heapObjects: parseFirstInt(content, /#\s*HeapObjects\s*=\s*(\d+)/),
+  numGC: parseFirstInt(content, /#\s*NumGC\s*=\s*(\d+)/),
+  maxRSS: parseFirstInt(content, /#\s*MaxRSS\s*=\s*(\d+)/),
+});
 
 type InstallCommands = {
   static?: string;
@@ -608,10 +782,19 @@ type ExitServiceModalProps = {
   onOpenChange: (open: boolean) => void;
   node: Node | null;
   isAdmin: boolean;
+  anytlsCertEnabled: boolean;
+  onChanged?: () => void;
 };
 
 const ExitServiceModal = memo(
-  ({ isOpen, onOpenChange, node, isAdmin }: ExitServiceModalProps) => {
+  ({
+    isOpen,
+    onOpenChange,
+    node,
+    isAdmin,
+    anytlsCertEnabled,
+    onChanged,
+  }: ExitServiceModalProps) => {
     const [exitType, setExitType] = useState<string>("ss");
     const [exitPort, setExitPort] = useState<number>(10000);
     const [exitPassword, setExitPassword] = useState<string>("");
@@ -625,7 +808,25 @@ const ExitServiceModal = memo(
     >([]);
     const [exitIfaces, setExitIfaces] = useState<string[]>([]);
     const [exitIfaceSel, setExitIfaceSel] = useState<string>("");
+    const [anytlsPortItems, setAnytlsPortItems] = useState<
+      Array<{ id: number; port: string; exitIp: string }>
+    >([{ id: Date.now(), port: "", exitIp: "" }]);
     const [anytlsAllowFallback, setAnytlsAllowFallback] = useState(false);
+    const [anytlsCertDomain, setAnytlsCertDomain] = useState("");
+    const [anytlsReissuing, setAnytlsReissuing] = useState(false);
+    type AnyTLSCertLogItem = {
+      id: number;
+      timeMs: number;
+      nodeId: number;
+      step: string;
+      message: string;
+      data?: string;
+    };
+    const [anytlsCertLogOpen, setAnytlsCertLogOpen] = useState(false);
+    const [anytlsCertLogLoading, setAnytlsCertLogLoading] = useState(false);
+    const [anytlsCertLogs, setAnytlsCertLogs] = useState<AnyTLSCertLogItem[]>(
+      [],
+    );
     const lastLoadedExitTypeRef = useRef<string>("");
     const assignedRanges = node?.assignedPortRanges || "";
     const isShared = !isAdmin && !!node?.shared;
@@ -643,7 +844,9 @@ const ExitServiceModal = memo(
       setExitRLimiter("");
       setExitMetaItems([]);
       setExitIfaceSel("");
+      setAnytlsPortItems([{ id: Date.now(), port: "", exitIp: "" }]);
       setAnytlsAllowFallback(false);
+      setAnytlsCertDomain("");
     }, [node, assignedRanges, isShared]);
 
     const loadExitConfig = useCallback(
@@ -661,7 +864,11 @@ const ExitServiceModal = memo(
         let dMetaItems: Array<{ id: number; key: string; value: string }> = [];
         let dIfaceSel = "";
         let dExitIp = "";
+        let dAnyTLSPortItems: Array<{ id: number; port: string; exitIp: string }> = [
+          { id: Date.now(), port: "", exitIp: "" },
+        ];
         let dAllowFallback = false;
+        let dCertDomain = node?.anytlsCert?.domain || "";
 
         try {
           const res = await getExitNode(node.id, type);
@@ -693,9 +900,38 @@ const ExitServiceModal = memo(
               if (typeof data.exitIp === "string") dExitIp = data.exitIp;
               if (typeof data.allowFallback === "boolean")
                 dAllowFallback = data.allowFallback;
+              if (typeof data.certDomain === "string")
+                dCertDomain = data.certDomain;
+              if (Array.isArray(data.anytlsPorts) && data.anytlsPorts.length > 0) {
+                dAnyTLSPortItems = data.anytlsPorts
+                  .map((it: any) => ({
+                    id: Date.now() + Math.random(),
+                    port:
+                      it && Number(it.port) > 0 ? String(Number(it.port)) : "",
+                    exitIp: typeof it?.exitIp === "string" ? it.exitIp : "",
+                  }))
+                  .filter((it: any) => it.port);
+              } else if (typeof data.port === "number" && data.port > 0) {
+                dAnyTLSPortItems = [
+                  {
+                    id: Date.now(),
+                    port: String(data.port),
+                    exitIp: dExitIp,
+                  },
+                ];
+              }
             }
           }
         } catch {}
+
+        if (type === "anytls" && anytlsCertEnabled && !dCertDomain) {
+          try {
+            const preview: any = await getAnyTLSCertPreview(node.id);
+            if (preview?.code === 0 && preview?.data?.domain) {
+              dCertDomain = String(preview.data.domain);
+            }
+          } catch {}
+        }
 
         if (isShared && assignedRanges) {
           if (!portInRanges(dPort, assignedRanges)) {
@@ -712,11 +948,17 @@ const ExitServiceModal = memo(
         setExitMetaItems(dMetaItems);
         setExitIfaceSel(dIfaceSel);
         if (type === "anytls") {
+          setAnytlsPortItems(
+            dAnyTLSPortItems.length > 0
+              ? dAnyTLSPortItems
+              : [{ id: Date.now(), port: "", exitIp: "" }],
+          );
           setExitIfaceSel(dExitIp);
           setAnytlsAllowFallback(dAllowFallback);
+          setAnytlsCertDomain(dCertDomain);
         }
       },
-      [node, resetDefaults, assignedRanges, isShared],
+      [node, resetDefaults, assignedRanges, isShared, anytlsCertEnabled],
     );
 
     useEffect(() => {
@@ -760,7 +1002,56 @@ const ExitServiceModal = memo(
         return;
       }
       if (!exitPort || exitPort < 1 || exitPort > 65535) {
-        toast.error("端口无效");
+        if (exitType !== "anytls") {
+          toast.error("端口无效");
+          return;
+        }
+      }
+      if (exitType === "anytls") {
+        const rows = anytlsPortItems
+          .map((it) => ({
+            port: Number(String(it.port || "").trim()),
+            exitIp: String(it.exitIp || "").trim(),
+          }))
+          .filter((it) => it.port > 0);
+        if (rows.length === 0) {
+          toast.error("请至少配置一个 AnyTLS 端口");
+          return;
+        }
+        if (isShared && assignedRanges) {
+          const invalid = rows.find((it) => !portInRanges(it.port, assignedRanges));
+          if (invalid) {
+            toast.error(`端口 ${invalid.port} 不在授权范围`);
+            return;
+          }
+        }
+        if (!exitPassword) {
+          toast.error("请填写密码");
+          return;
+        }
+        setExitSubmitting(true);
+        try {
+          const res = await setExitNode({
+            nodeId: node.id,
+            type: "anytls",
+            port: rows[0].port,
+            anytlsPorts: rows,
+            password: exitPassword,
+            allowFallback: anytlsAllowFallback,
+            certDomain: anytlsCertEnabled ? anytlsCertDomain.trim() : "",
+          } as any);
+          if (res.code === 0) {
+            toast.success("AnyTLS 已创建/更新");
+            onChanged?.();
+            onOpenChange(false);
+          } else {
+            toast.error(res.msg || "操作失败");
+          }
+        } catch (e) {
+          toast.error("网络错误");
+        } finally {
+          setExitSubmitting(false);
+        }
 
         return;
       }
@@ -776,40 +1067,29 @@ const ExitServiceModal = memo(
       setExitSubmitting(true);
       try {
         let res;
+        const metadata: any = {};
 
-        if (exitType === "anytls") {
-          res = await setExitNode({
-            nodeId: node.id,
-            type: "anytls",
-            port: exitPort,
-            password: exitPassword,
-            exitIp: exitIfaceSel,
-            allowFallback: anytlsAllowFallback,
-          } as any);
-        } else {
-          const metadata: any = {};
-
-          exitMetaItems.forEach((it: { key: string; value: string }) => {
-            if (it.key && it.value) metadata[it.key] = it.value;
-          });
-          if (exitIfaceSel) {
-            (metadata as any)["interface"] = exitIfaceSel;
-          }
-          res = await setExitNode({
-            nodeId: node.id,
-            type: "ss",
-            port: exitPort,
-            password: exitPassword,
-            method: exitMethod,
-            observer: exitObserver,
-            limiter: exitLimiter,
-            rlimiter: exitRLimiter,
-            metadata,
-          } as any);
+        exitMetaItems.forEach((it: { key: string; value: string }) => {
+          if (it.key && it.value) metadata[it.key] = it.value;
+        });
+        if (exitIfaceSel) {
+          (metadata as any)["interface"] = exitIfaceSel;
         }
+        res = await setExitNode({
+          nodeId: node.id,
+          type: "ss",
+          port: exitPort,
+          password: exitPassword,
+          method: exitMethod,
+          observer: exitObserver,
+          limiter: exitLimiter,
+          rlimiter: exitRLimiter,
+          metadata,
+        } as any);
 
         if (res.code === 0) {
-          toast.success(exitType === "anytls" ? "AnyTLS 已创建/更新" : "出口服务已创建/更新");
+          toast.success("出口服务已创建/更新");
+          onChanged?.();
           onOpenChange(false);
         } else {
           toast.error(res.msg || "操作失败");
@@ -821,17 +1101,68 @@ const ExitServiceModal = memo(
       }
     };
 
+    const forceReissueAnyTLSCert = async () => {
+      if (!node?.id) return;
+      if (
+        !window.confirm(
+          "确认强制重新颁发 AnyTLS 证书并立即下发到该节点吗？",
+        )
+      ) {
+        return;
+      }
+      setAnytlsReissuing(true);
+      try {
+        const res: any = await reissueAnyTLSCert(
+          node.id,
+          anytlsCertDomain.trim() || undefined,
+        );
+        if (res?.code === 0) {
+          toast.success("AnyTLS 证书已重新颁发并下发");
+          const domain =
+            String(res?.data?.certDomain || "") ||
+            String(res?.data?.certStatus?.domain || "");
+          if (domain) setAnytlsCertDomain(domain);
+          await loadExitConfig("anytls");
+          onChanged?.();
+        } else {
+          toast.error(res?.msg || "证书重签失败");
+        }
+      } catch (e: any) {
+        toast.error(e?.message || "证书重签失败");
+      } finally {
+        setAnytlsReissuing(false);
+      }
+    };
+
+    const loadAnyTLSCertLogs = useCallback(async () => {
+      if (!node?.id) return;
+      setAnytlsCertLogLoading(true);
+      try {
+        const res: any = await listNodeAnyTLSCertLogs({
+          nodeId: node.id,
+          limit: 200,
+        });
+        const list = Array.isArray(res?.data?.logs) ? res.data.logs : [];
+        setAnytlsCertLogs(list);
+      } catch {
+        setAnytlsCertLogs([]);
+      } finally {
+        setAnytlsCertLogLoading(false);
+      }
+    }, [node?.id]);
+
     return (
-      <Modal
-        backdrop="opaque"
-        disableAnimation
-        isOpen={isOpen}
-        size="md"
-        onOpenChange={onOpenChange}
-      >
-        <ModalContent>
-          {(onClose) => (
-            <>
+      <>
+        <Modal
+          backdrop="opaque"
+          disableAnimation
+          isOpen={isOpen}
+          size="md"
+          onOpenChange={onOpenChange}
+        >
+          <ModalContent>
+            {(onClose) => (
+              <>
               <ModalHeader>
                 设置出口节点服务{node?.name ? ` · ${node.name}` : ""}
               </ModalHeader>
@@ -852,10 +1183,10 @@ const ExitServiceModal = memo(
                       </SelectItem>
                     ))}
                   </Select>
-                  {exitType === "anytls" && (
+                  {exitType === "anytls" && anytlsCertEnabled && (
                     <Alert
                       color="primary"
-                      description="AnyTLS 将自动生成自签证书，客户端默认不校验即可使用。"
+                      description="AnyTLS 使用控制器签发证书。客户端需开启证书校验，不可跳过。"
                       variant="flat"
                     />
                   )}
@@ -1040,37 +1371,127 @@ const ExitServiceModal = memo(
                   )}
                   {exitType === "anytls" && (
                     <div>
-                      <div className="text-sm text-default-600 mb-1">
-                        AnyTLS 出口IP（可选）
-                      </div>
-                      <Select
-                        isDisabled={exitIfaces.length === 0}
-                        label="请选择出口IP"
-                        placeholder={
-                          exitIfaces.length
-                            ? "选择出口IP"
-                            : "未获取到出口IP列表"
-                        }
-                        selectedKeys={exitIfaceSel ? [exitIfaceSel] : []}
-                        onSelectionChange={(keys) => {
-                          const val = Array.from(keys as Set<string>)[0] || "";
-                          setExitIfaceSel(val);
-                        }}
-                      >
-                        {exitIfaces.map((ip) => (
-                          <SelectItem key={ip}>{ip}</SelectItem>
-                        ))}
-                      </Select>
-                      {exitIfaceSel && (
-                        <Button
-                          className="mt-2"
-                          size="sm"
-                          variant="light"
-                          onPress={() => setExitIfaceSel("")}
-                        >
-                          清除选择
-                        </Button>
+                      {anytlsCertEnabled ? (
+                        <>
+                          <Input
+                            description="可输入完整域名；或输入前缀（自动生成 节点IDjs.前缀.docker.com）"
+                            label="AnyTLS 证书域名"
+                            placeholder="例如: abcd 或 n1.example.com"
+                            value={anytlsCertDomain}
+                            onChange={(e: any) => setAnytlsCertDomain(e.target.value)}
+                          />
+                          <Button
+                            className="mt-2"
+                            size="sm"
+                            variant="flat"
+                            onPress={() => {
+                              const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+                              let s = "";
+                              for (let i = 0; i < 8; i++) {
+                                s += chars[Math.floor(Math.random() * chars.length)];
+                              }
+                              setAnytlsCertDomain(s);
+                            }}
+                          >
+                            随机前缀（docker.com）
+                          </Button>
+                          <Button
+                            className="mt-2 ml-2"
+                            color="warning"
+                            isLoading={anytlsReissuing}
+                            size="sm"
+                            variant="flat"
+                            onPress={() => {
+                              void forceReissueAnyTLSCert();
+                            }}
+                          >
+                            强制重新颁发证书
+                          </Button>
+                          <Button
+                            className="mt-2 ml-2"
+                            size="sm"
+                            variant="flat"
+                            onPress={() => {
+                              setAnytlsCertLogOpen(true);
+                              void loadAnyTLSCertLogs();
+                            }}
+                          >
+                            查看证书安装日志
+                          </Button>
+                        </>
+                      ) : (
+                        <Alert
+                          className="mb-2"
+                          color="default"
+                          description="证书功能已关闭：当前 AnyTLS 使用隐匿模式，证书域名与重签入口已隐藏。"
+                          variant="flat"
+                        />
                       )}
+                      <div className="text-sm text-default-600 mb-1">
+                        AnyTLS 端口与出口IP（出口IP可选）
+                      </div>
+                      <div className="space-y-2">
+                        {anytlsPortItems.map((row, idx) => (
+                          <div key={row.id} className="grid grid-cols-12 gap-2 items-end">
+                            <Input
+                              className="col-span-4"
+                              label={idx === 0 ? "端口" : `端口 #${idx + 1}`}
+                              type="number"
+                              value={row.port}
+                              onChange={(e: any) =>
+                                setAnytlsPortItems((prev) =>
+                                  prev.map((it) =>
+                                    it.id === row.id ? { ...it, port: e.target.value } : it,
+                                  ),
+                                )
+                              }
+                            />
+                            <Select
+                              className="col-span-7"
+                              isDisabled={exitIfaces.length === 0}
+                              label="出口IP"
+                              placeholder={exitIfaces.length ? "选择出口IP" : "未获取到出口IP列表"}
+                              selectedKeys={row.exitIp ? [row.exitIp] : []}
+                              onSelectionChange={(keys) => {
+                                const val = Array.from(keys as Set<string>)[0] || "";
+                                setAnytlsPortItems((prev) =>
+                                  prev.map((it) =>
+                                    it.id === row.id ? { ...it, exitIp: val } : it,
+                                  ),
+                                );
+                              }}
+                            >
+                              {exitIfaces.map((ip) => (
+                                <SelectItem key={ip}>{ip}</SelectItem>
+                              ))}
+                            </Select>
+                            <Button
+                              className="col-span-1"
+                              color="danger"
+                              isDisabled={anytlsPortItems.length <= 1}
+                              size="sm"
+                              variant="light"
+                              onPress={() =>
+                                setAnytlsPortItems((prev) => prev.filter((it) => it.id !== row.id))
+                              }
+                            >
+                              删
+                            </Button>
+                          </div>
+                        ))}
+                        <Button
+                          size="sm"
+                          variant="flat"
+                          onPress={() =>
+                            setAnytlsPortItems((prev) => [
+                              ...prev,
+                              { id: Date.now() + Math.random(), port: "", exitIp: "" },
+                            ])
+                          }
+                        >
+                          新增端口
+                        </Button>
+                      </div>
                       <div className="mt-3">
                         <Switch
                           isSelected={anytlsAllowFallback}
@@ -1098,17 +1519,107 @@ const ExitServiceModal = memo(
                   保存
                 </Button>
               </ModalFooter>
-            </>
-          )}
-        </ModalContent>
-      </Modal>
+              </>
+            )}
+          </ModalContent>
+        </Modal>
+        <Modal
+          backdrop="opaque"
+          disableAnimation
+          isOpen={anytlsCertLogOpen}
+          size="2xl"
+          onOpenChange={setAnytlsCertLogOpen}
+        >
+          <ModalContent>
+            {(onClose) => (
+              <>
+                <ModalHeader>
+                  AnyTLS 证书安装日志{node?.name ? ` · ${node.name}` : ""}
+                </ModalHeader>
+                <ModalBody>
+                  <div className="flex items-center justify-between mb-2">
+                    <div className="text-xs text-default-500">
+                      仅显示该节点 agent 上报的证书安装/更新/重载日志
+                    </div>
+                    <Button
+                      isLoading={anytlsCertLogLoading}
+                      size="sm"
+                      variant="flat"
+                      onPress={() => {
+                        void loadAnyTLSCertLogs();
+                      }}
+                    >
+                      刷新
+                    </Button>
+                  </div>
+                  {anytlsCertLogLoading ? (
+                    <div className="py-8 flex justify-center">
+                      <Spinner size="sm" />
+                    </div>
+                  ) : anytlsCertLogs.length === 0 ? (
+                    <div className="text-sm text-default-500 py-6 text-center">
+                      暂无证书日志
+                    </div>
+                  ) : (
+                    <div className="space-y-2 max-h-[55vh] overflow-y-auto">
+                      {anytlsCertLogs.map((it) => (
+                        <div
+                          key={it.id}
+                          className="rounded-lg border border-default-200 p-2"
+                        >
+                          <div className="text-xs text-default-500 mb-1">
+                            {it.timeMs
+                              ? new Date(it.timeMs).toLocaleString()
+                              : "-"}
+                            {it.step ? ` · ${it.step}` : ""}
+                          </div>
+                          <div className="text-sm">{it.message || "-"}</div>
+                          {it.data ? (
+                            <pre className="mt-2 text-xs bg-default-100 rounded p-2 overflow-x-auto whitespace-pre-wrap break-all">
+                              {it.data}
+                            </pre>
+                          ) : null}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </ModalBody>
+                <ModalFooter>
+                  <Button variant="light" onPress={onClose}>
+                    关闭
+                  </Button>
+                </ModalFooter>
+              </>
+            )}
+          </ModalContent>
+        </Modal>
+      </>
     );
   },
 );
 
 export default function NodePage() {
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const initialKeyword = searchParams.get("q") || "";
+  const initialConn =
+    searchParams.get("conn") === "online" || searchParams.get("conn") === "offline"
+      ? (searchParams.get("conn") as "online" | "offline")
+      : "all";
+  const initialAnyTLS =
+    searchParams.get("anytls") === "healthy" ||
+    searchParams.get("anytls") === "degraded" ||
+    searchParams.get("anytls") === "unknown"
+      ? (searchParams.get("anytls") as "healthy" | "degraded" | "unknown")
+      : "all";
   const [nodeList, setNodeList] = useState<Node[]>([]);
+  const [nodeKeyword, setNodeKeyword] = useState(initialKeyword);
+  const [nodeConnFilter, setNodeConnFilter] = useState<
+    "all" | "online" | "offline"
+  >(initialConn);
+  const [nodeAnyTLSFilter, setNodeAnyTLSFilter] = useState<
+    "all" | "healthy" | "degraded" | "unknown"
+  >(initialAnyTLS);
   const [loading, setLoading] = useState(false);
   const gridWrapRef = useRef<HTMLDivElement | null>(null);
   const [nodeRowHeight, setNodeRowHeight] = useState(360);
@@ -1139,6 +1650,10 @@ export default function NodePage() {
     Array<{ timeMs: number; cmd: string; message: string }>
   >([]);
   const [upgradeLoading, setUpgradeLoading] = useState(false);
+  const [upgradeAllLoading, setUpgradeAllLoading] = useState(false);
+  const [upgradeNodeLoading, setUpgradeNodeLoading] = useState<
+    Record<number, boolean>
+  >({});
   const [upgradeNodeId, setUpgradeNodeId] = useState<number | null>(null);
 
   // 安装命令相关状态
@@ -1257,6 +1772,23 @@ export default function NodePage() {
     done: false,
     requestId: "",
   });
+  const [pprofState, setPprofState] = useState<{
+    enabled: boolean;
+    addr: string;
+    loading: boolean;
+    fetchLoading: boolean;
+    quickTesting: boolean;
+    content: string;
+    profile: PprofProfile;
+  }>({
+    enabled: false,
+    addr: "",
+    loading: false,
+    fetchLoading: false,
+    quickTesting: false,
+    content: "",
+    profile: "goroutine",
+  });
   const logScrollRef = useRef<HTMLDivElement | null>(null);
   const diagPollRef = useRef<number | null>(null);
   const iperfPollRef = useRef<number | null>(null);
@@ -1279,6 +1811,30 @@ export default function NodePage() {
     running: false,
     connecting: false,
   });
+  const [certChainModal, setCertChainModal] = useState<{
+    open: boolean;
+    title: string;
+    data: any | null;
+  }>({
+    open: false,
+    title: "",
+    data: null,
+  });
+  const [anytlsLogModal, setAnytlsLogModal] = useState<{
+    open: boolean;
+    nodeId: number | null;
+    nodeName: string;
+    loading: boolean;
+    logs: AnyTLSRuntimeLogItem[];
+    status: AnyTLSRuntimeStatus | null;
+  }>({
+    open: false,
+    nodeId: null,
+    nodeName: "",
+    loading: false,
+    logs: [],
+    status: null,
+  });
   const isAdmin = (() => {
     const rid =
       localStorage.getItem("role_id") || localStorage.getItem("roleId");
@@ -1296,7 +1852,9 @@ export default function NodePage() {
     nqModal.open ||
     installCommandModal ||
     usedPortsModal.open ||
-    usageModal.open;
+    usageModal.open ||
+    certChainModal.open ||
+    anytlsLogModal.open;
   const scrollPosRef = useRef<number | null>(null);
 
   const getScrollEl = () => {
@@ -1372,14 +1930,33 @@ export default function NodePage() {
   const [reapplyLoading, setReapplyLoading] = useState<Record<number, boolean>>(
     {},
   );
+  const [certRefreshLoading, setCertRefreshLoading] = useState<
+    Record<number, boolean>
+  >({});
+  const [certChainLoading, setCertChainLoading] = useState<Record<number, boolean>>(
+    {},
+  );
+  const [anytlsCertEnabled, setAnytlsCertEnabled] = useState(false);
   const pageVisible = usePageVisibility();
   const [pollMs, setPollMs] = useState<number>(5000);
+  const pendingWsStatusRef = useRef<Map<number, "online" | "offline">>(
+    new Map(),
+  );
+  const pendingWsInfoRef = useRef<Map<number, any>>(new Map());
+  const pendingIperf3Ref = useRef<
+    Map<number, { status: string; port: string; loading: boolean }>
+  >(new Map());
+  const wsFlushTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     loadNodes();
     initWebSocket();
 
     return () => {
+      if (wsFlushTimerRef.current != null) {
+        window.clearTimeout(wsFlushTimerRef.current);
+        wsFlushTimerRef.current = null;
+      }
       closeWebSocket();
       closeTermWS();
     };
@@ -1393,7 +1970,36 @@ export default function NodePage() {
 
         setPollMs(n * 1000);
       } catch {}
+      try {
+        const v = await getCachedConfig("anytls_cert_enabled");
+        const s = String(v || "")
+          .trim()
+          .toLowerCase();
+        setAnytlsCertEnabled(
+          s === "1" || s === "true" || s === "yes" || s === "on" || s === "enabled",
+        );
+      } catch {}
     })();
+  }, []);
+
+  useEffect(() => {
+    const handler = async (ev: any) => {
+      const changed = Array.isArray(ev?.detail?.changedKeys)
+        ? (ev.detail.changedKeys as string[])
+        : [];
+      if (changed.length > 0 && !changed.includes("anytls_cert_enabled")) return;
+      try {
+        const v = await getCachedConfig("anytls_cert_enabled");
+        const s = String(v || "")
+          .trim()
+          .toLowerCase();
+        setAnytlsCertEnabled(
+          s === "1" || s === "true" || s === "yes" || s === "on" || s === "enabled",
+        );
+      } catch {}
+    };
+    window.addEventListener("configUpdated", handler);
+    return () => window.removeEventListener("configUpdated", handler);
   }, []);
 
   useEffect(() => {
@@ -1420,22 +2026,46 @@ export default function NodePage() {
     }
   };
 
+  const escapeTerminalHtml = (value: unknown) =>
+    String(value ?? "").replace(/[&<>"']/g, (ch) => {
+      const escapes: Record<string, string> = {
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+      };
+
+      return escapes[ch] || ch;
+    });
+
+  const sanitizeTerminalColor = (value: string | null, fallback: string) => {
+    const raw = String(value || "").trim();
+
+    return /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(raw)
+      ? raw
+      : fallback;
+  };
+
   const openTerminalWindow = (node: Node) => {
     const token = localStorage.getItem("token") || "";
     const proto = window.location.protocol === "https:" ? "wss" : "ws";
     const wsUrl = `${proto}://${window.location.host}/api/v1/node/${node.id}/terminal?token=${encodeURIComponent(token)}`;
+    const safeNodeName = escapeTerminalHtml(node.name);
+    const termBg = sanitizeTerminalColor(localStorage.getItem("term_bg"), "#151729");
+    const termFg = sanitizeTerminalColor(localStorage.getItem("term_fg"), "#209d5f");
     const html = `
 <!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>终端 - ${node.name}</title>
+  <title>终端 - ${safeNodeName}</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
   <style>
     html, body { margin:0; padding:0; width:100%; height:100%; background:#000; color:#d1d5db; font-family: monospace; }
     #layout { display:flex; width:100%; height:100%; padding:0; box-sizing:border-box; gap:6px; }
-    #term-wrap { flex: 1 1 90%; background: ${localStorage.getItem("term_bg") || "#151729"}; border-radius:6px; overflow:hidden; }
+    #term-wrap { flex: 1 1 90%; background: ${termBg}; border-radius:6px; overflow:hidden; }
     #term, .xterm { width:100% !important; height:100% !important; padding:4px; box-sizing:border-box; }
     #side { flex: 0 0 10%; min-width:200px; background:#111; color:#d1d5db; padding:10px; box-sizing:border-box; border-left:1px solid #222; font-size:12px; display:flex; flex-direction:column; gap:10px; transition: width 0.2s ease; }
     #side.hidden { display:none; }
@@ -1468,7 +2098,7 @@ export default function NodePage() {
       </div>
       <div>
         <div><strong>节点</strong></div>
-        <div>${node.name}</div>
+        <div>${safeNodeName}</div>
       </div>
       <div>
         <div><strong>资源</strong></div>
@@ -1531,8 +2161,8 @@ export default function NodePage() {
       rendererType: isMobile ? "dom" : "canvas",
       fontFamily: 'Menlo, Consolas, "Courier New", monospace',
       theme:{
-        background: "${localStorage.getItem("term_bg") || "#151729"}",
-        foreground: "${localStorage.getItem("term_fg") || "#209d5f"}"
+        background: ${JSON.stringify(termBg)},
+        foreground: ${JSON.stringify(termFg)}
       },
       scrollback:2000
     });
@@ -1961,6 +2591,160 @@ export default function NodePage() {
     navigate(`/network/${node.id}`);
   };
 
+  const parseWsSystemInfo = (messageData: any) => {
+    try {
+      if (typeof messageData === "string") {
+        return JSON.parse(messageData);
+      }
+
+      return messageData;
+    } catch {
+      return null;
+    }
+  };
+
+  const applyWsSystemInfo = (node: Node, systemInfo: any): Node => {
+    if (!systemInfo || Object.keys(systemInfo).length === 0) {
+      return node;
+    }
+
+    const toNum = (v: any): number | undefined => {
+      if (v === null || typeof v === "undefined" || v === "") return undefined;
+      const n = Number(v);
+
+      return Number.isFinite(n) ? n : undefined;
+    };
+    const currentUpload = parseInt(systemInfo.bytes_transmitted) || 0;
+    const currentDownload = parseInt(systemInfo.bytes_received) || 0;
+    const currentUptime = parseInt(systemInfo.uptime) || 0;
+
+    if (!currentUptime && node.systemInfo) {
+      return node;
+    }
+
+    let uploadSpeed = 0;
+    let downloadSpeed = 0;
+
+    if (node.systemInfo && node.systemInfo.uptime) {
+      const timeDiff = currentUptime - node.systemInfo.uptime;
+
+      if (timeDiff > 0 && timeDiff <= 10) {
+        const lastUpload = node.systemInfo.uploadTraffic || 0;
+        const lastDownload = node.systemInfo.downloadTraffic || 0;
+        const uploadDiff = currentUpload - lastUpload;
+        const downloadDiff = currentDownload - lastDownload;
+
+        if (currentUpload >= lastUpload && uploadDiff >= 0) {
+          uploadSpeed = uploadDiff / timeDiff;
+        }
+
+        if (currentDownload >= lastDownload && downloadDiff >= 0) {
+          downloadSpeed = downloadDiff / timeDiff;
+        }
+      }
+    }
+
+    return {
+      ...node,
+      connectionStatus: "online",
+      systemInfo: {
+        cpuUsage: parseFloat(systemInfo.cpu_usage) || 0,
+        memoryUsage: parseFloat(systemInfo.memory_usage) || 0,
+        uploadTraffic: currentUpload,
+        downloadTraffic: currentDownload,
+        uploadSpeed,
+        downloadSpeed,
+        uptime: currentUptime,
+        gostApi: !!systemInfo.gost_api,
+        gostRunning: !!systemInfo.gost_running,
+        gostApiConfigured:
+          systemInfo.gost_api_configured !== undefined
+            ? !!systemInfo.gost_api_configured
+            : !!systemInfo.gost_api,
+        agentHeapAllocMb: toNum(systemInfo.agent_heap_alloc_mb),
+        agentHeapInuseMb: toNum(systemInfo.agent_heap_inuse_mb),
+        agentStackInuseMb: toNum(systemInfo.agent_stack_inuse_mb),
+        agentSysMb: toNum(systemInfo.agent_sys_mb),
+        agentRssMb: toNum(systemInfo.agent_rss_mb),
+        agentNumGc: toNum(systemInfo.agent_num_gc),
+        agentLastGcPauseMs: toNum(systemInfo.agent_last_gc_pause_ms),
+        agentGcCpuPercent: toNum(systemInfo.agent_gc_cpu_percent),
+        agentGoRoutines: toNum(systemInfo.agent_go_routines),
+        agentMemCollectedAtMs: toNum(systemInfo.agent_mem_collected_at_ms),
+      },
+    };
+  };
+
+  const flushWsNodeUpdates = () => {
+    wsFlushTimerRef.current = null;
+    const statusMap = new Map(pendingWsStatusRef.current);
+    const infoMap = new Map(pendingWsInfoRef.current);
+    const iperfMap = new Map(pendingIperf3Ref.current);
+
+    pendingWsStatusRef.current.clear();
+    pendingWsInfoRef.current.clear();
+    pendingIperf3Ref.current.clear();
+
+    if (statusMap.size > 0 || infoMap.size > 0) {
+      setNodeList((prev) => {
+        let changed = false;
+        const next = prev.map((node) => {
+          let out = node;
+          const status = statusMap.get(node.id);
+
+          if (status && status !== out.connectionStatus) {
+            out = {
+              ...out,
+              connectionStatus: status,
+              systemInfo: out.systemInfo,
+            };
+          }
+          if (infoMap.has(node.id)) {
+            const updated = applyWsSystemInfo(out, infoMap.get(node.id));
+
+            if (updated !== out) {
+              out = updated;
+            }
+          }
+          if (out !== node) {
+            changed = true;
+          }
+
+          return out;
+        });
+
+        return changed ? next : prev;
+      });
+    }
+
+    if (iperfMap.size > 0) {
+      setIperf3Map((prev) => {
+        let changed = false;
+        const next = { ...prev };
+
+        iperfMap.forEach((value, id) => {
+          const old = prev[id];
+
+          if (
+            !old ||
+            old.status !== value.status ||
+            old.port !== value.port ||
+            old.loading !== value.loading
+          ) {
+            next[id] = value;
+            changed = true;
+          }
+        });
+
+        return changed ? next : prev;
+      });
+    }
+  };
+
+  const scheduleWsNodeFlush = () => {
+    if (wsFlushTimerRef.current != null) return;
+    wsFlushTimerRef.current = window.setTimeout(flushWsNodeUpdates, 200);
+  };
 
   // 初始化WebSocket连接
   const initWebSocket = () => {
@@ -2036,127 +2820,44 @@ export default function NodePage() {
   const handleWebSocketMessage = (data: any) => {
     if (suspendRealtimeRef.current) return;
     const { id, type, data: messageData } = data;
+    const nodeID = Number(id);
+
+    if (!Number.isFinite(nodeID) || nodeID <= 0) return;
 
     if (type === "status") {
-      setNodeList((prev) =>
-        prev.map((node) => {
-          if (node.id == id) {
-            return {
-              ...node,
-              connectionStatus: messageData === 1 ? "online" : "offline",
-              systemInfo: node.systemInfo,
-            };
-          }
-
-          return node;
-        }),
+      pendingWsStatusRef.current.set(
+        nodeID,
+        messageData === 1 ? "online" : "offline",
       );
+      scheduleWsNodeFlush();
     } else if (type === "info") {
-      setNodeList((prev) =>
-        prev.map((node) => {
-          if (node.id == id) {
-            try {
-              let systemInfo;
+      const systemInfo = parseWsSystemInfo(messageData);
 
-              if (typeof messageData === "string") {
-                systemInfo = JSON.parse(messageData);
-              } else {
-                systemInfo = messageData;
-              }
-              if (!systemInfo || Object.keys(systemInfo).length === 0) {
-                return node;
-              }
+      if (!systemInfo || Object.keys(systemInfo).length === 0) return;
 
-              const currentUpload = parseInt(systemInfo.bytes_transmitted) || 0;
-              const currentDownload = parseInt(systemInfo.bytes_received) || 0;
-              const currentUptime = parseInt(systemInfo.uptime) || 0;
+      pendingWsInfoRef.current.set(nodeID, systemInfo);
 
-              if (!currentUptime && node.systemInfo) {
-                return node;
-              }
-
-              let uploadSpeed = 0;
-              let downloadSpeed = 0;
-
-              if (node.systemInfo && node.systemInfo.uptime) {
-                const timeDiff = currentUptime - node.systemInfo.uptime;
-
-                if (timeDiff > 0 && timeDiff <= 10) {
-                  const lastUpload = node.systemInfo.uploadTraffic || 0;
-                  const lastDownload = node.systemInfo.downloadTraffic || 0;
-
-                  const uploadDiff = currentUpload - lastUpload;
-                  const downloadDiff = currentDownload - lastDownload;
-
-                  const uploadReset = currentUpload < lastUpload;
-                  const downloadReset = currentDownload < lastDownload;
-
-                  if (!uploadReset && uploadDiff >= 0) {
-                    uploadSpeed = uploadDiff / timeDiff;
-                  }
-
-                  if (!downloadReset && downloadDiff >= 0) {
-                    downloadSpeed = downloadDiff / timeDiff;
-                  }
-                }
-              }
-
-              return {
-                ...node,
-                connectionStatus: "online",
-                systemInfo: {
-                  cpuUsage: parseFloat(systemInfo.cpu_usage) || 0,
-                  memoryUsage: parseFloat(systemInfo.memory_usage) || 0,
-                  uploadTraffic: currentUpload,
-                  downloadTraffic: currentDownload,
-                  uploadSpeed: uploadSpeed,
-                  downloadSpeed: downloadSpeed,
-                  uptime: currentUptime,
-                  gostApi: !!systemInfo.gost_api,
-                  gostRunning: !!systemInfo.gost_running,
-                  // Prefer explicit configured flag; fallback to api reachable for agents未上报configured的旧版
-                  gostApiConfigured:
-                    systemInfo.gost_api_configured !== undefined
-                      ? !!systemInfo.gost_api_configured
-                      : !!systemInfo.gost_api,
-                },
-              };
-            } catch (error) {
-              return node;
-            }
-          }
-
-          return node;
-        }),
-      );
       try {
-        let systemInfo;
-        if (typeof messageData === "string") {
-          systemInfo = JSON.parse(messageData);
-        } else {
-          systemInfo = messageData;
-        }
         const iperfStatus = systemInfo?.iperf3_status;
         const iperfPort = systemInfo?.iperf3_port;
+
         if (iperfStatus !== undefined) {
-          setIperf3Map((prev) => ({
-            ...prev,
-            [Number(id)]: {
-              status: String(iperfStatus),
-              port: iperfPort ? String(iperfPort) : "",
-              loading: false,
-            },
-          }));
-          if (selfCheckModal.open && selfCheckModal.nodeId === Number(id)) {
+          const nextIperf = {
+            status: String(iperfStatus),
+            port: iperfPort ? String(iperfPort) : "",
+            loading: false,
+          };
+
+          pendingIperf3Ref.current.set(nodeID, nextIperf);
+          if (selfCheckModal.open && selfCheckModal.nodeId === nodeID) {
             setIperf3Status((prev) => ({
               ...prev,
-              status: String(iperfStatus),
-              port: iperfPort ? String(iperfPort) : "",
-              loading: false,
+              ...nextIperf,
             }));
           }
         }
       } catch {}
+      scheduleWsNodeFlush();
     }
   };
 
@@ -2209,6 +2910,118 @@ export default function NodePage() {
       setReapplyLoading((prev) => ({ ...prev, [nodeId]: false }));
     }
   };
+
+  const doForceRefreshAnyTLSCert = async (node: Node) => {
+    if (!node?.id) return;
+    if (!anytlsCertEnabled) {
+      toast.error("证书功能已关闭");
+      return;
+    }
+    if (!nodeHasAnyTLS(node)) {
+      toast.error("该节点未启用 AnyTLS 出口");
+      return;
+    }
+    if (!window.confirm(`确认强制刷新 ${node.name} 的 AnyTLS 证书吗？`)) {
+      return;
+    }
+    setCertRefreshLoading((prev) => ({ ...prev, [node.id]: true }));
+    try {
+      const res: any = await reissueAnyTLSCert(
+        node.id,
+        node.anytlsCert?.domain || undefined,
+      );
+      if (res?.code === 0) {
+        toast.success("证书已重签并下发");
+        await loadNodes(true, true);
+      } else {
+        toast.error(res?.msg || "证书刷新失败");
+      }
+    } catch (e: any) {
+      toast.error(e?.message || "证书刷新失败");
+    } finally {
+      setCertRefreshLoading((prev) => ({ ...prev, [node.id]: false }));
+    }
+  };
+
+  const doCheckAnyTLSCertChain = async (node: Node) => {
+    if (!node?.id) return;
+    if (!anytlsCertEnabled) {
+      toast.error("证书功能已关闭");
+      return;
+    }
+    if (!nodeHasAnyTLS(node)) {
+      toast.error("该节点未启用 AnyTLS 出口");
+      return;
+    }
+    setCertChainLoading((prev) => ({ ...prev, [node.id]: true }));
+    try {
+      const res: any = await checkAnyTLSCertChain(node.id);
+      if (res?.code === 0) {
+        const data = res?.data || {};
+        setCertChainModal({
+          open: true,
+          title: `AnyTLS 链校验 · ${node.name}`,
+          data,
+        });
+        if (data?.verifyOK) {
+          toast.success("证书链校验通过");
+        } else {
+          toast.error(data?.verifyErr || "证书链校验失败");
+        }
+      } else {
+        toast.error(res?.msg || "链校验失败");
+      }
+    } catch (e: any) {
+      toast.error(e?.message || "链校验失败");
+    } finally {
+      setCertChainLoading((prev) => ({ ...prev, [node.id]: false }));
+    }
+  };
+
+  const loadAnyTLSRuntimeLogs = useCallback(
+    async (nodeId: number) => {
+      if (!nodeId) return;
+      setAnytlsLogModal((prev) => ({ ...prev, loading: true }));
+      try {
+        const res: any = await listNodeAnyTLSRuntimeLogs({
+          nodeId,
+          limit: 200,
+          windowSec: 900,
+        });
+        const logs = Array.isArray(res?.data?.logs) ? res.data.logs : [];
+        const status = res?.data?.status || null;
+        setAnytlsLogModal((prev) => ({
+          ...prev,
+          logs,
+          status,
+          loading: false,
+        }));
+      } catch {
+        setAnytlsLogModal((prev) => ({
+          ...prev,
+          logs: [],
+          status: null,
+          loading: false,
+        }));
+      }
+    },
+    [],
+  );
+
+  const openAnyTLSLogModal = useCallback(
+    (node: Node) => {
+      setAnytlsLogModal({
+        open: true,
+        nodeId: node.id,
+        nodeName: node.name,
+        loading: true,
+        logs: [],
+        status: null,
+      });
+      void loadAnyTLSRuntimeLogs(node.id);
+    },
+    [loadAnyTLSRuntimeLogs],
+  );
 
   const showGostConfig = async (node: Node) => {
     setGostConfigModal({
@@ -2454,6 +3267,9 @@ export default function NodePage() {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
   };
 
+  const formatMB = (val?: number): string =>
+    typeof val === "number" && Number.isFinite(val) ? `${val.toFixed(1)} MB` : "-";
+
   const formatFlowBytes = (bytes: number): string => {
     if (!bytes || bytes <= 0) return "0 B";
     const k = 1024;
@@ -2598,6 +3414,15 @@ export default function NodePage() {
     });
     stopIperfPolling();
     setIperf3Status({ status: "unknown", port: "", pid: "", loading: true });
+    setPprofState({
+      enabled: false,
+      addr: "",
+      loading: isAdmin,
+      fetchLoading: false,
+      quickTesting: false,
+      content: "",
+      profile: "goroutine",
+    });
     setIperf3Map((prev) => ({
       ...prev,
       [node.id]: {
@@ -2614,6 +3439,23 @@ export default function NodePage() {
       loading: true,
       result: null,
     });
+    if (isAdmin) {
+      try {
+        const rs: any = await nodePprofControl(node.id, "status");
+        if (rs?.code === 0 && rs?.data) {
+          setPprofState((prev) => ({
+            ...prev,
+            enabled: !!rs.data.enabled,
+            addr: String(rs.data.addr || ""),
+            loading: false,
+          }));
+        } else {
+          setPprofState((prev) => ({ ...prev, loading: false }));
+        }
+      } catch {
+        setPprofState((prev) => ({ ...prev, loading: false }));
+      }
+    }
     try {
       const res: any = await nodeSelfCheck(node.id);
 
@@ -2648,6 +3490,229 @@ export default function NodePage() {
       iperfPollRef.current = null;
     }
   };
+
+  const refreshPprofStatus = useCallback(async (nodeId: number) => {
+    setPprofState((prev) => ({ ...prev, loading: true }));
+    try {
+      const rs: any = await nodePprofControl(nodeId, "status");
+      if (rs?.code === 0 && rs?.data) {
+        setPprofState((prev) => ({
+          ...prev,
+          enabled: !!rs.data.enabled,
+          addr: String(rs.data.addr || ""),
+          loading: false,
+        }));
+      } else {
+        setPprofState((prev) => ({ ...prev, loading: false }));
+        toast.error(rs?.msg || "获取 pprof 状态失败");
+      }
+    } catch (e: any) {
+      setPprofState((prev) => ({ ...prev, loading: false }));
+      toast.error(e?.message || "获取 pprof 状态失败");
+    }
+  }, []);
+
+  const handlePprofControl = useCallback(
+    async (action: "enable" | "disable") => {
+      const nodeId = selfCheckModal.nodeId;
+      if (!nodeId) return;
+      setPprofState((prev) => ({ ...prev, loading: true }));
+      try {
+        const rs: any = await nodePprofControl(nodeId, action);
+        if (rs?.code === 0 && rs?.data) {
+          setPprofState((prev) => ({
+            ...prev,
+            enabled: !!rs.data.enabled,
+            addr: String(rs.data.addr || ""),
+            loading: false,
+          }));
+          toast.success(action === "enable" ? "pprof 已开启" : "pprof 已关闭");
+        } else {
+          setPprofState((prev) => ({ ...prev, loading: false }));
+          toast.error(rs?.msg || "pprof 操作失败");
+        }
+      } catch (e: any) {
+        setPprofState((prev) => ({ ...prev, loading: false }));
+        toast.error(e?.message || "pprof 操作失败");
+      }
+    },
+    [selfCheckModal.nodeId],
+  );
+
+  const handlePprofFetch = useCallback(
+    async (profile: PprofProfile) => {
+      const nodeId = selfCheckModal.nodeId;
+      if (!nodeId) return;
+      setPprofState((prev) => ({
+        ...prev,
+        fetchLoading: true,
+        quickTesting: false,
+        profile,
+      }));
+      try {
+        const rs: any = await nodePprofFetch(nodeId, profile, 1);
+        if (rs?.code === 0 && rs?.data) {
+          setPprofState((prev) => ({
+            ...prev,
+            fetchLoading: false,
+            content: String(rs.data.content || ""),
+            addr: String(rs.data.addr || prev.addr),
+          }));
+        } else {
+          setPprofState((prev) => ({ ...prev, fetchLoading: false }));
+          toast.error(rs?.msg || "拉取 pprof 失败");
+        }
+      } catch (e: any) {
+        setPprofState((prev) => ({ ...prev, fetchLoading: false }));
+        toast.error(e?.message || "拉取 pprof 失败");
+      }
+    },
+    [selfCheckModal.nodeId],
+  );
+
+  const handlePprofQuickTest = useCallback(async () => {
+    const nodeId = selfCheckModal.nodeId;
+    if (!nodeId) return;
+    const startAt = Date.now();
+    setPprofState((prev) => ({
+      ...prev,
+      fetchLoading: true,
+      quickTesting: true,
+      profile: "goroutine",
+      content: "[quick-test] 正在准备...",
+    }));
+    try {
+      let pprofAddr = String(pprofState.addr || "");
+      if (!pprofState.enabled) {
+        const en: any = await nodePprofControl(nodeId, "enable");
+        if (!(en?.code === 0 && en?.data?.enabled)) {
+          throw new Error(en?.msg || "pprof 开启失败");
+        }
+        pprofAddr = String(en.data.addr || "");
+        setPprofState((prev) => ({
+          ...prev,
+          enabled: true,
+          addr: pprofAddr,
+          loading: false,
+        }));
+      }
+
+      const baselineRs: any = await nodePprofFetch(nodeId, "goroutine", 1);
+      if (!(baselineRs?.code === 0 && baselineRs?.data?.content)) {
+        throw new Error(baselineRs?.msg || "获取基线 goroutine 失败");
+      }
+      const baseContent = String(baselineRs.data.content || "");
+      const base = parseGoroutineSnapshot(baseContent);
+      pprofAddr = String(baselineRs?.data?.addr || pprofAddr);
+      setPprofState((prev) => ({
+        ...prev,
+        content: `[quick-test] 基线 goroutine=${base.total}，正在触发短负载...`,
+        addr: pprofAddr || prev.addr,
+      }));
+
+      let selfCheckOk = 0;
+      let selfCheckErr = 0;
+      for (let i = 0; i < 2; i++) {
+        try {
+          const rs: any = await nodeSelfCheck(nodeId);
+          if (rs?.code === 0) selfCheckOk++;
+          else selfCheckErr++;
+        } catch {
+          selfCheckErr++;
+        }
+        await sleepMs(800);
+      }
+
+      setPprofState((prev) => ({
+        ...prev,
+        content: "[quick-test] 负载完成，等待 8 秒观察回落...",
+      }));
+      await sleepMs(8000);
+
+      const afterRs: any = await nodePprofFetch(nodeId, "goroutine", 1);
+      if (!(afterRs?.code === 0 && afterRs?.data?.content)) {
+        throw new Error(afterRs?.msg || "获取结束 goroutine 失败");
+      }
+      const afterContent = String(afterRs.data.content || "");
+      const after = parseGoroutineSnapshot(afterContent);
+      pprofAddr = String(afterRs?.data?.addr || pprofAddr);
+
+      const heapRs: any = await nodePprofFetch(nodeId, "heap", 1);
+      const heapContent =
+        heapRs?.code === 0 && heapRs?.data?.content
+          ? String(heapRs.data.content || "")
+          : "";
+      const heap = parseHeapSnapshot(heapContent);
+
+      const fmt = (n: number) => n.toLocaleString("en-US");
+      const sign = (n: number) => (n >= 0 ? `+${n}` : `${n}`);
+      const report = [
+        "[Agent pprof quick-test report]",
+        `node=${selfCheckModal.nodeName} id=${nodeId}`,
+        `time=${new Date().toISOString()}`,
+        `pprof_addr=${pprofAddr || "-"}`,
+        `window_seconds=${Math.max(1, Math.round((Date.now() - startAt) / 1000))}`,
+        `self_check_trigger=ok:${selfCheckOk},err:${selfCheckErr}`,
+        "",
+        "[goroutine baseline]",
+        `total=${fmt(base.total)}`,
+        `anytls_stacks=${fmt(base.anytlsStacks)}`,
+        `copyConnWithLimiter=${fmt(base.copyConn)}`,
+        `copyPacketConnWithLimiter=${fmt(base.copyPacketConn)}`,
+        `copyStreamLimited=${fmt(base.copyStream)}`,
+        `copyPacketLimited=${fmt(base.copyPacket)}`,
+        `session.recvLoop=${fmt(base.sessionRecv)}`,
+        "",
+        "[goroutine after]",
+        `total=${fmt(after.total)} (${sign(after.total - base.total)})`,
+        `anytls_stacks=${fmt(after.anytlsStacks)} (${sign(after.anytlsStacks - base.anytlsStacks)})`,
+        `copyConnWithLimiter=${fmt(after.copyConn)} (${sign(after.copyConn - base.copyConn)})`,
+        `copyPacketConnWithLimiter=${fmt(after.copyPacketConn)} (${sign(after.copyPacketConn - base.copyPacketConn)})`,
+        `copyStreamLimited=${fmt(after.copyStream)} (${sign(after.copyStream - base.copyStream)})`,
+        `copyPacketLimited=${fmt(after.copyPacket)} (${sign(after.copyPacket - base.copyPacket)})`,
+        `session.recvLoop=${fmt(after.sessionRecv)} (${sign(after.sessionRecv - base.sessionRecv)})`,
+        "",
+        "[heap snapshot]",
+        `heap_alloc_mb=${toMB(heap.heapAlloc)}`,
+        `heap_inuse_mb=${toMB(heap.heapInuse)}`,
+        `heap_objects=${fmt(heap.heapObjects)}`,
+        `num_gc=${fmt(heap.numGC)}`,
+        `max_rss_mb=${toMB(heap.maxRSS)}`,
+      ].join("\n");
+
+      setPprofState((prev) => ({
+        ...prev,
+        fetchLoading: false,
+        quickTesting: false,
+        profile: "goroutine",
+        addr: pprofAddr || prev.addr,
+        content: report,
+      }));
+      toast.success("一键回归测试完成，可复制报告");
+    } catch (e: any) {
+      setPprofState((prev) => ({
+        ...prev,
+        fetchLoading: false,
+        quickTesting: false,
+        content: `[quick-test] 失败：${String(e?.message || "未知错误")}`,
+      }));
+      toast.error(e?.message || "一键回归测试失败");
+    }
+  }, [selfCheckModal.nodeId, selfCheckModal.nodeName, pprofState.addr, pprofState.enabled]);
+
+  const copyPprofReport = useCallback(async () => {
+    const text = String(pprofState.content || "").trim();
+    if (!text) {
+      toast.error("暂无报告可复制");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      toast.success("报告已复制");
+    } catch {
+      toast.error("复制失败");
+    }
+  }, [pprofState.content]);
 
   const pollIperfStatus = async (nodeId: number) => {
     try {
@@ -2854,6 +3919,73 @@ export default function NodePage() {
     }
   }, []);
 
+  const handleUpgradeOneAgent = async (node: Node) => {
+    if (node.connectionStatus !== "online") {
+      toast.error("节点离线，无法触发升级");
+      return;
+    }
+    setUpgradeNodeLoading((prev) => ({ ...prev, [node.id]: true }));
+    try {
+      const res: any = await upgradeNodeAgentsBatch([node.id]);
+      if (res?.code === 0) {
+        const item = Array.isArray(res?.data?.results)
+          ? res.data.results.find((r: any) => Number(r?.nodeId) === node.id)
+          : null;
+        if (item?.ok === false) {
+          toast.error(item?.error || "触发升级失败");
+        } else {
+          toast.success(`已触发 ${node.name} 升级`);
+        }
+        setUpgradeModalOpen(true);
+        setUpgradeNodeId(node.id);
+        void loadUpgradeSummary();
+        void loadUpgradeLogs(node.id);
+      } else {
+        toast.error(res?.msg || "触发升级失败");
+      }
+    } catch (e: any) {
+      toast.error(e?.message || "触发升级失败");
+    } finally {
+      setUpgradeNodeLoading((prev) => ({ ...prev, [node.id]: false }));
+    }
+  };
+
+  const handleUpgradeAllAgents = async () => {
+    if (nodeList.length === 0) {
+      toast.error("暂无节点可升级");
+      return;
+    }
+    if (
+      !window.confirm(
+        `确认手动触发全部节点 Agent 升级吗？共 ${nodeList.length} 个节点。`,
+      )
+    ) {
+      return;
+    }
+    setUpgradeAllLoading(true);
+    try {
+      const res: any = await upgradeNodeAgentsBatch(nodeList.map((n) => n.id));
+      if (res?.code === 0) {
+        const ok = Number(res?.data?.ok || 0);
+        const total = Number(res?.data?.total || nodeList.length);
+        const failed = Number(res?.data?.failed || 0);
+        if (failed > 0) {
+          toast.error(`已触发升级 ${ok}/${total}，失败 ${failed}`);
+        } else {
+          toast.success(`已触发升级 ${ok}/${total}`);
+        }
+        setUpgradeModalOpen(true);
+        void loadUpgradeSummary();
+      } else {
+        toast.error(res?.msg || "触发全部升级失败");
+      }
+    } catch (e: any) {
+      toast.error(e?.message || "触发全部升级失败");
+    } finally {
+      setUpgradeAllLoading(false);
+    }
+  };
+
   useEffect(() => {
     if (!upgradeModalOpen) return;
     loadUpgradeSummary();
@@ -2870,6 +4002,57 @@ export default function NodePage() {
       stopIperfPolling();
     };
   }, []);
+
+  useEffect(() => {
+    const next = new URLSearchParams();
+    const kw = nodeKeyword.trim();
+
+    if (kw) next.set("q", kw);
+    if (nodeConnFilter !== "all") next.set("conn", nodeConnFilter);
+    if (nodeAnyTLSFilter !== "all") next.set("anytls", nodeAnyTLSFilter);
+    if (next.toString() !== searchParams.toString()) {
+      setSearchParams(next, { replace: true });
+    }
+  }, [
+    nodeKeyword,
+    nodeConnFilter,
+    nodeAnyTLSFilter,
+    searchParams,
+    setSearchParams,
+  ]);
+
+  const anytlsDegradedCount = nodeList.filter(
+    (n) => nodeHasAnyTLS(n) && n.anytlsRuntime?.state === "degraded",
+  ).length;
+  const filteredNodeList = nodeList.filter((node) => {
+    if (nodeConnFilter !== "all" && node.connectionStatus !== nodeConnFilter) {
+      return false;
+    }
+    if (nodeAnyTLSFilter !== "all") {
+      if (!nodeHasAnyTLS(node)) {
+        return false;
+      }
+      const state = (node.anytlsRuntime?.state || "unknown").toLowerCase();
+      if (state !== nodeAnyTLSFilter) {
+        return false;
+      }
+    }
+    if (nodeKeyword.trim()) {
+      const kw = nodeKeyword.trim().toLowerCase();
+      const hay = [
+        node.name || "",
+        node.ip || "",
+        node.serverIp || "",
+        node.anytlsCert?.domain || "",
+      ]
+        .join(" ")
+        .toLowerCase();
+      if (!hay.includes(kw)) {
+        return false;
+      }
+    }
+    return true;
+  });
 
   return (
     <div className="np-page">
@@ -2902,6 +4085,13 @@ export default function NodePage() {
             <div>
               后端: {serverVersion || "-"} · Agent: {agentVersion || "-"}
             </div>
+            <Chip
+              color={anytlsDegradedCount > 0 ? "warning" : "success"}
+              size="sm"
+              variant="flat"
+            >
+              AnyTLS异常 {anytlsDegradedCount}
+            </Chip>
           </div>
         </div>
 
@@ -2909,6 +4099,15 @@ export default function NodePage() {
           <>
             <Button color="primary" size="sm" variant="flat" onPress={handleAdd}>
               新增
+            </Button>
+            <Button
+              color="default"
+              size="sm"
+              variant="flat"
+              isLoading={upgradeAllLoading}
+              onPress={handleUpgradeAllAgents}
+            >
+              全部升级
             </Button>
             <Button
               color="default"
@@ -2971,6 +4170,70 @@ export default function NodePage() {
         </Card>
       ) : nodeList.length > 0 ? (
         <>
+          <div className="flex flex-wrap items-end gap-2 mb-2">
+            <Input
+              className="w-full sm:w-64"
+              placeholder="搜索 名称/IP/证书域名"
+              size="sm"
+              value={nodeKeyword}
+              variant="bordered"
+              onChange={(e) => setNodeKeyword(e.target.value)}
+            />
+            <Select
+              className="w-full sm:w-40"
+              labelPlacement="outside"
+              placeholder="在线状态"
+              selectedKeys={[nodeConnFilter]}
+              size="sm"
+              variant="bordered"
+              onChange={(e) =>
+                setNodeConnFilter(
+                  ((e.target as any).value as "all" | "online" | "offline") ||
+                    "all",
+                )
+              }
+            >
+              <SelectItem key="all">全部状态</SelectItem>
+              <SelectItem key="online">仅在线</SelectItem>
+              <SelectItem key="offline">仅离线</SelectItem>
+            </Select>
+            <Select
+              className="w-full sm:w-48"
+              labelPlacement="outside"
+              placeholder="AnyTLS状态"
+              selectedKeys={[nodeAnyTLSFilter]}
+              size="sm"
+              variant="bordered"
+              onChange={(e) =>
+                setNodeAnyTLSFilter(
+                  ((e.target as any).value as
+                    | "all"
+                    | "healthy"
+                    | "degraded"
+                    | "unknown") || "all",
+                )
+              }
+            >
+              <SelectItem key="all">AnyTLS全部</SelectItem>
+              <SelectItem key="degraded">仅异常</SelectItem>
+              <SelectItem key="healthy">仅健康</SelectItem>
+              <SelectItem key="unknown">仅未知</SelectItem>
+            </Select>
+            <Button
+              size="sm"
+              variant="flat"
+              onPress={() => {
+                setNodeKeyword("");
+                setNodeConnFilter("all");
+                setNodeAnyTLSFilter("all");
+              }}
+            >
+              重置筛选
+            </Button>
+            <Chip size="sm" variant="flat">
+              命中 {filteredNodeList.length}/{nodeList.length}
+            </Chip>
+          </div>
           {isAdmin ? (
             <div className="flex justify-end mb-2 gap-2">
               <Button size="sm" variant="flat" onPress={() => setOpsOpen(true)}>
@@ -3008,22 +4271,29 @@ export default function NodePage() {
               </Button>
             </div>
           ) : null}
-          <div
-            ref={gridWrapRef}
-            style={{ visibility: gridReady ? "visible" : "hidden" }}
-          >
-            <VirtualGrid
-              className="w-full"
-              estimateRowHeight={nodeRowHeight}
-              items={nodeList}
-              minItemWidth={320}
-              renderItem={(node) => {
-                const readOnly = !isAdmin && !!node.shared;
-                return (
-                  <Card
-                    key={node.id}
-                    className={`list-card node-card hover:shadow-md transition-shadow duration-200 ${node.connectionStatus === "offline" ? "node-card-offline" : ""}`}
-                  >
+          {filteredNodeList.length === 0 ? (
+            <Card className="np-card">
+              <CardBody className="text-center py-12 text-default-500">
+                当前筛选条件下暂无节点
+              </CardBody>
+            </Card>
+          ) : (
+            <div
+              ref={gridWrapRef}
+              style={{ visibility: gridReady ? "visible" : "hidden" }}
+            >
+              <VirtualGrid
+                className="w-full"
+                estimateRowHeight={nodeRowHeight}
+                items={filteredNodeList}
+                minItemWidth={280}
+                renderItem={(node) => {
+                  const readOnly = !isAdmin && !!node.shared;
+                  return (
+                    <Card
+                      key={node.id}
+                      className={`list-card node-card hover:shadow-md transition-shadow duration-200 ${node.connectionStatus === "offline" ? "node-card-offline" : ""}`}
+                    >
                     <CardHeader className="pb-2">
                       <div className="flex justify-between items-start w-full">
                         <div className="flex-1 min-w-0">
@@ -3141,6 +4411,139 @@ export default function NodePage() {
                     ) : null}
                   </div>
 
+                  {anytlsCertEnabled && node.anytlsCert?.domain ? (
+                    <div className="flex flex-wrap items-center gap-2 text-xs">
+                      <Chip
+                        size="sm"
+                        variant="flat"
+                        color={
+                          node.anytlsCert?.state === "expired"
+                            ? "danger"
+                            : node.anytlsCert?.state === "expiring"
+                              ? "warning"
+                              : "success"
+                        }
+                      >
+                        AnyTLS 证书
+                      </Chip>
+                      <span className="font-mono text-default-700 break-all">
+                        {node.anytlsCert.domain}
+                      </span>
+                      <span className="text-default-500">
+                        到期{" "}
+                        {node.anytlsCert.notAfterMs
+                          ? new Date(node.anytlsCert.notAfterMs).toLocaleString()
+                          : "-"}
+                      </span>
+                      <span className="text-default-500">
+                        剩余{" "}
+                        {typeof node.anytlsCert.daysLeft === "number"
+                          ? `${node.anytlsCert.daysLeft} 天`
+                          : "-"}
+                      </span>
+                      <span className="text-default-500">
+                        来源{" "}
+                        {node.anytlsCert.source === "agent_log"
+                          ? "Agent已安装"
+                          : node.anytlsCert.source === "controller_estimate"
+                            ? "控制器估算"
+                            : "-"}
+                      </span>
+                      <span className="text-default-500">
+                        更新{" "}
+                        {node.anytlsCert.updatedAtMs
+                          ? new Date(node.anytlsCert.updatedAtMs).toLocaleString()
+                          : "-"}
+                      </span>
+                    </div>
+                  ) : null}
+
+                  {nodeHasAnyTLS(node) ? (
+                    <div className="flex flex-wrap items-center gap-2 text-xs">
+                      <Chip
+                        size="sm"
+                        variant="flat"
+                        color={
+                          node.anytlsRuntime?.state === "healthy"
+                            ? "success"
+                            : node.anytlsRuntime?.state === "degraded"
+                              ? "warning"
+                              : "default"
+                        }
+                      >
+                        AnyTLS状态 {node.anytlsRuntime?.state || "unknown"}
+                      </Chip>
+                      <span className="text-default-500">
+                        窗口 {node.anytlsRuntime?.windowSec || 900}s
+                      </span>
+                      <span className="text-default-500">
+                        日志 {node.anytlsRuntime?.recentCount || 0}
+                      </span>
+                      {(node.anytlsRuntime?.connReject || 0) > 0 ? (
+                        <span className="text-warning-600">
+                          拒绝 {node.anytlsRuntime?.connReject || 0}
+                        </span>
+                      ) : null}
+                      {(node.anytlsRuntime?.acceptErr || 0) > 0 ? (
+                        <span className="text-warning-600">
+                          accept错 {node.anytlsRuntime?.acceptErr || 0}
+                        </span>
+                      ) : null}
+                      {(node.anytlsRuntime?.handshakeTimeout || 0) > 0 ? (
+                        <span className="text-warning-600">
+                          握手超时 {node.anytlsRuntime?.handshakeTimeout || 0}
+                        </span>
+                      ) : null}
+                      {(node.anytlsRuntime?.tlsHandshakeErr || 0) > 0 ? (
+                        <span className="text-danger-600">
+                          TLS握手错 {node.anytlsRuntime?.tlsHandshakeErr || 0}
+                          {(node.anytlsRuntime?.tlsConnResetByPeer || 0) > 0
+                            ? ` (重置 ${
+                                node.anytlsRuntime?.tlsConnResetByPeer || 0
+                              }/${node.anytlsRuntime?.tlsHandshakeErr || 0}, ${(
+                                (((node.anytlsRuntime?.tlsConnResetByPeer || 0) *
+                                  100) /
+                                  Math.max(
+                                    1,
+                                    node.anytlsRuntime?.tlsHandshakeErr || 0,
+                                  )) || 0
+                              ).toFixed(1)}%)`
+                            : ""}
+                        </span>
+                      ) : null}
+                      {(node.anytlsRuntime?.tlsClientHello || 0) > 0 ? (
+                        <span className="text-default-500">
+                          SNI失配 {node.anytlsRuntime?.tlsSniMismatch || 0}/
+                          {node.anytlsRuntime?.tlsClientHello || 0} ({(
+                            (((node.anytlsRuntime?.tlsSniMismatch || 0) * 100) /
+                              Math.max(1, node.anytlsRuntime?.tlsClientHello || 0)) ||
+                            0
+                          ).toFixed(1)}%)
+                        </span>
+                      ) : null}
+                      {(node.anytlsRuntime?.listenErr || 0) > 0 ? (
+                        <span className="text-danger-600">
+                          监听错 {node.anytlsRuntime?.listenErr || 0}
+                        </span>
+                      ) : null}
+                      {(node.anytlsRuntime?.streamErr || 0) > 0 ? (
+                        <span className="text-danger-600">
+                          转发错 {node.anytlsRuntime?.streamErr || 0}
+                        </span>
+                      ) : null}
+                      {(node.anytlsRuntime?.authFail || 0) > 0 ? (
+                        <span className="text-warning-600">
+                          鉴权失败 {node.anytlsRuntime?.authFail || 0}
+                        </span>
+                      ) : null}
+                      {(node.anytlsRuntime?.readErr || 0) > 0 ? (
+                        <span className="text-warning-600">
+                          读包错 {node.anytlsRuntime?.readErr || 0}
+                        </span>
+                      ) : null}
+                    </div>
+                  ) : null}
+
                   {!readOnly ? (() => {
                     const hasSystemInfo =
                       !!node.systemInfo &&
@@ -3179,6 +4582,38 @@ export default function NodePage() {
                           ),
                         )
                       : 0;
+                    const agentRssMb = node.systemInfo?.agentRssMb;
+                    const agentHeapAllocMb = node.systemInfo?.agentHeapAllocMb;
+                    const agentGoRoutines = node.systemInfo?.agentGoRoutines;
+                    const agentNumGc = node.systemInfo?.agentNumGc;
+                    const hasAgentRuntime =
+                      typeof agentRssMb === "number" ||
+                      typeof agentHeapAllocMb === "number" ||
+                      typeof agentGoRoutines === "number";
+                    const memHealth =
+                      typeof agentRssMb === "number"
+                        ? agentRssMb <= 96
+                          ? "low"
+                          : agentRssMb <= 192
+                            ? "mid"
+                            : "high"
+                        : "unknown";
+                    const memHealthColor =
+                      memHealth === "low"
+                        ? "success"
+                        : memHealth === "mid"
+                          ? "warning"
+                          : memHealth === "high"
+                            ? "danger"
+                            : "default";
+                    const memHealthText =
+                      memHealth === "low"
+                        ? "正常"
+                        : memHealth === "mid"
+                          ? "偏高"
+                          : memHealth === "high"
+                            ? "高"
+                            : "-";
 
                     return (
                       <div className="grid grid-cols-2 gap-2 text-xs">
@@ -3247,6 +4682,32 @@ export default function NodePage() {
                               style={{ width: `${downPct}%` }}
                             />
                           </div>
+                        </div>
+                        <div className="np-soft p-2 col-span-2">
+                          <div className="flex items-center justify-between mb-1 text-default-600">
+                            <span>Agent 内存</span>
+                            <Chip color={memHealthColor as any} size="sm" variant="flat">
+                              {memHealthText}
+                            </Chip>
+                          </div>
+                          <div className="font-mono text-default-700 flex flex-wrap items-center gap-x-3 gap-y-1">
+                            <span>RSS: {formatMB(agentRssMb)}</span>
+                            <span>Heap: {formatMB(agentHeapAllocMb)}</span>
+                            <span>
+                              Goroutines:{" "}
+                              {typeof agentGoRoutines === "number"
+                                ? Math.round(agentGoRoutines)
+                                : "-"}
+                            </span>
+                            <span>
+                              GC: {typeof agentNumGc === "number" ? Math.round(agentNumGc) : "-"}
+                            </span>
+                          </div>
+                          {!hasAgentRuntime ? (
+                            <div className="text-default-400 mt-1">
+                              等待 Agent 上报进程内存指标
+                            </div>
+                          ) : null}
                         </div>
                       </div>
                     );
@@ -3320,9 +4781,28 @@ export default function NodePage() {
                             variant="flat"
                             onPress={async () => {
                               try {
-                                await enableGostApi(node.id);
+                                const input = window.prompt(
+                                  "请输入 GOST API 端口（默认 18080）",
+                                  "18080",
+                                );
+                                if (input === null) return;
+                                const trimmed = String(input).trim();
+                                let port: number | undefined = undefined;
+                                if (trimmed !== "") {
+                                  const n = Number(trimmed);
+                                  if (
+                                    !Number.isInteger(n) ||
+                                    n <= 0 ||
+                                    n > 65535
+                                  ) {
+                                    toast.error("端口需为 1-65535 的整数");
+                                    return;
+                                  }
+                                  port = n;
+                                }
+                                await enableGostApi(node.id, port);
                                 toast.success(
-                                  "已发送启用 GOST API 指令，稍候刷新",
+                                  "已发送启用 GOST API 指令（仅本机127.0.0.1监听），稍候刷新",
                                 );
                               } catch (e: any) {
                                 toast.error(e?.message || "指令发送失败");
@@ -3332,18 +4812,92 @@ export default function NodePage() {
                             GOST API
                           </Button>
                         ) : (node.systemInfo as any).gostApiConfigured === true ? (
-                          <Button
-                            className="h-6 min-h-6 px-2 text-xs"
-                            color="secondary"
-                            size="sm"
-                            variant="flat"
-                            onPress={() => showGostConfig(node)}
-                          >
-                            配置
-                          </Button>
+                          <>
+                            <Button
+                              className="h-6 min-h-6 px-2 text-xs"
+                              color="primary"
+                              size="sm"
+                              variant="flat"
+                              onPress={async () => {
+                                try {
+                                  const input = window.prompt(
+                                    "请输入 GOST API 端口（默认 18080）",
+                                    "18080",
+                                  );
+                                  if (input === null) return;
+                                  const trimmed = String(input).trim();
+                                  let port: number | undefined = undefined;
+                                  if (trimmed !== "") {
+                                    const n = Number(trimmed);
+                                    if (
+                                      !Number.isInteger(n) ||
+                                      n <= 0 ||
+                                      n > 65535
+                                    ) {
+                                      toast.error("端口需为 1-65535 的整数");
+                                      return;
+                                    }
+                                    port = n;
+                                  }
+                                  await enableGostApi(node.id, port);
+                                  toast.success(
+                                    "已发送重配 GOST API 指令（仅本机127.0.0.1监听），稍候刷新",
+                                  );
+                                } catch (e: any) {
+                                  toast.error(e?.message || "指令发送失败");
+                                }
+                              }}
+                            >
+                              API端口
+                            </Button>
+                            <Button
+                              className="h-6 min-h-6 px-2 text-xs"
+                              color="secondary"
+                              size="sm"
+                              variant="flat"
+                              onPress={() => showGostConfig(node)}
+                            >
+                              配置
+                            </Button>
+                          </>
                         ) : null
                       ) : null}
                       </div>
+                      <Tooltip
+                        content={
+                          <div className="text-xs">
+                            <div>
+                              {node.gostApiBindDetail || "GOST API 监听校验"}
+                            </div>
+                            <div className="text-default-500">
+                              {node.gostApiBindCheckedAtMs
+                                ? `校验时间 ${new Date(
+                                    node.gostApiBindCheckedAtMs,
+                                  ).toLocaleString()}`
+                                : "校验时间 -"}
+                            </div>
+                          </div>
+                        }
+                      >
+                        <Chip
+                          size="sm"
+                          variant="flat"
+                          color={
+                            node.gostApiBindLoopbackOnly === true
+                              ? "success"
+                              : node.gostApiBindLoopbackOnly === false
+                                ? "danger"
+                                : "default"
+                          }
+                        >
+                          API本地监听
+                          {node.gostApiBindLoopbackOnly === true
+                            ? "已校验"
+                            : node.gostApiBindLoopbackOnly === false
+                              ? "异常"
+                              : "未知"}
+                        </Chip>
+                      </Tooltip>
                       {(node.priceCents || node.cycleMonths) && (
                         <span className="np-tag">
                           ¥{(node.priceCents || 0) / 100}
@@ -3355,7 +4909,7 @@ export default function NodePage() {
 
                   {/* 操作按钮 */}
                   <div className="space-y-1.5">
-                    <div className={`grid gap-2 ${readOnly ? "grid-cols-1" : "grid-cols-3"}`}>
+                    <div className={`grid gap-2 ${readOnly ? "grid-cols-1" : "grid-cols-2 sm:grid-cols-3"}`}>
                       {!readOnly ? (
                         <Button
                           className="w-full min-h-8"
@@ -3368,6 +4922,19 @@ export default function NodePage() {
                           安装
                         </Button>
                       ) : null}
+                      {!readOnly && isAdmin ? (
+                        <Button
+                          className="w-full min-h-8"
+                          color="default"
+                          size="sm"
+                          variant="flat"
+                          isLoading={!!upgradeNodeLoading[node.id]}
+                          isDisabled={node.connectionStatus !== "online"}
+                          onPress={() => handleUpgradeOneAgent(node)}
+                        >
+                          升级
+                        </Button>
+                      ) : null}
                       <Button
                         className="w-full min-h-8"
                         color="warning"
@@ -3377,6 +4944,44 @@ export default function NodePage() {
                       >
                         出口
                       </Button>
+                      {!readOnly && anytlsCertEnabled ? (
+                        <Button
+                          className="w-full min-h-8"
+                          color="secondary"
+                          size="sm"
+                          variant="flat"
+                          isLoading={!!certRefreshLoading[node.id]}
+                          isDisabled={!nodeHasAnyTLS(node)}
+                          onPress={() => doForceRefreshAnyTLSCert(node)}
+                        >
+                          刷新证书
+                        </Button>
+                      ) : null}
+                      {!readOnly && anytlsCertEnabled ? (
+                        <Button
+                          className="w-full min-h-8"
+                          color="primary"
+                          size="sm"
+                          variant="flat"
+                          isLoading={!!certChainLoading[node.id]}
+                          isDisabled={!nodeHasAnyTLS(node)}
+                          onPress={() => doCheckAnyTLSCertChain(node)}
+                        >
+                          链校验
+                        </Button>
+                      ) : null}
+                      {!readOnly ? (
+                        <Button
+                          className="w-full min-h-8"
+                          color="secondary"
+                          size="sm"
+                          variant="flat"
+                          isDisabled={!nodeHasAnyTLS(node)}
+                          onPress={() => openAnyTLSLogModal(node)}
+                        >
+                          AnyTLS日志
+                        </Button>
+                      ) : null}
                       {!readOnly ? (
                         <>
                           <Button
@@ -3467,11 +5072,12 @@ export default function NodePage() {
                     </div>
                   </div>
                     </CardBody>
-                  </Card>
-                );
-              }}
-            />
-          </div>
+                    </Card>
+                  );
+                }}
+              />
+            </div>
+          )}
         </>
       ) : null}
 
@@ -3550,6 +5156,8 @@ export default function NodePage() {
         isOpen={exitModalOpen}
         node={exitNode}
         isAdmin={isAdmin}
+        anytlsCertEnabled={anytlsCertEnabled}
+        onChanged={handleNodeSaved}
         onOpenChange={handleExitModalChange}
       />
 
@@ -3645,6 +5253,264 @@ export default function NodePage() {
                     )}
                   </div>
                 </div>
+              </ModalBody>
+              <ModalFooter>
+                <Button variant="light" onPress={onClose}>
+                  关闭
+                </Button>
+              </ModalFooter>
+            </>
+          )}
+        </ModalContent>
+      </Modal>
+
+      <Modal
+        backdrop="opaque"
+        disableAnimation
+        isOpen={certChainModal.open}
+        placement="center"
+        scrollBehavior="outside"
+        size="3xl"
+        onOpenChange={(open) =>
+          setCertChainModal((prev) => ({ ...prev, open }))
+        }
+      >
+        <ModalContent>
+          {(onClose) => (
+            <>
+              <ModalHeader>{certChainModal.title || "AnyTLS 链校验"}</ModalHeader>
+              <ModalBody>
+                <div className="text-sm space-y-2">
+                  <div>
+                    校验结果：
+                    {certChainModal.data?.verifyOK ? (
+                      <span className="text-success font-medium"> 通过</span>
+                    ) : (
+                      <span className="text-danger font-medium"> 失败</span>
+                    )}
+                  </div>
+                  <div>
+                    目标地址：{certChainModal.data?.selectedAddr || "-"} · SNI{" "}
+                    {certChainModal.data?.domain || "-"}
+                  </div>
+                  {!certChainModal.data?.verifyOK && certChainModal.data?.verifyErr ? (
+                    <div className="text-danger break-all">
+                      错误：{String(certChainModal.data.verifyErr)}
+                    </div>
+                  ) : null}
+                </div>
+                <Textarea
+                  readOnly
+                  className="font-mono text-xs"
+                  minRows={14}
+                  value={JSON.stringify(certChainModal.data || {}, null, 2)}
+                />
+              </ModalBody>
+              <ModalFooter>
+                <Button
+                  color="primary"
+                  variant="flat"
+                  onPress={async () => {
+                    try {
+                      await navigator.clipboard.writeText(
+                        JSON.stringify(certChainModal.data || {}, null, 2),
+                      );
+                      toast.success("已复制链校验结果");
+                    } catch {
+                      toast.error("复制失败");
+                    }
+                  }}
+                >
+                  复制结果
+                </Button>
+                <Button variant="light" onPress={onClose}>
+                  关闭
+                </Button>
+              </ModalFooter>
+            </>
+          )}
+        </ModalContent>
+      </Modal>
+
+      <Modal
+        backdrop="opaque"
+        disableAnimation
+        isOpen={anytlsLogModal.open}
+        placement="center"
+        scrollBehavior="outside"
+        size="3xl"
+        onOpenChange={(open) => {
+          if (!open) {
+            setAnytlsLogModal({
+              open: false,
+              nodeId: null,
+              nodeName: "",
+              loading: false,
+              logs: [],
+              status: null,
+            });
+            return;
+          }
+          setAnytlsLogModal((prev) => ({ ...prev, open }));
+        }}
+      >
+        <ModalContent>
+          {(onClose) => (
+            <>
+              <ModalHeader>
+                AnyTLS 运行日志
+                {anytlsLogModal.nodeName ? ` · ${anytlsLogModal.nodeName}` : ""}
+              </ModalHeader>
+              <ModalBody>
+                <div className="flex items-center justify-between gap-3 mb-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Chip size="sm" variant="flat" color={
+                      anytlsLogModal.status?.state === "healthy"
+                        ? "success"
+                        : anytlsLogModal.status?.state === "degraded"
+                          ? "warning"
+                          : "default"
+                    }>
+                      状态 {anytlsLogModal.status?.state || "unknown"}
+                    </Chip>
+                    <Chip size="sm" variant="flat">
+                      窗口 {anytlsLogModal.status?.windowSec || 0}s
+                    </Chip>
+                    <Chip size="sm" variant="flat">
+                      最近日志 {anytlsLogModal.status?.recentCount || 0}
+                    </Chip>
+                    <Chip size="sm" variant="flat">
+                      拒绝 {anytlsLogModal.status?.connReject || 0}
+                    </Chip>
+                    <Chip size="sm" variant="flat">
+                      accept错 {anytlsLogModal.status?.acceptErr || 0}
+                    </Chip>
+                    <Chip size="sm" variant="flat">
+                      握手超时 {anytlsLogModal.status?.handshakeTimeout || 0}
+                    </Chip>
+                    <Chip size="sm" variant="flat">
+                      TLS握手错 {anytlsLogModal.status?.tlsHandshakeErr || 0}
+                    </Chip>
+                    <Chip size="sm" variant="flat">
+                      握手重置 {anytlsLogModal.status?.tlsConnResetByPeer || 0}/
+                      {anytlsLogModal.status?.tlsHandshakeErr || 0} ({(
+                        (((anytlsLogModal.status?.tlsConnResetByPeer || 0) * 100) /
+                          Math.max(1, anytlsLogModal.status?.tlsHandshakeErr || 0)) ||
+                        0
+                      ).toFixed(1)}%)
+                    </Chip>
+                    <Chip size="sm" variant="flat">
+                      SNI失配 {anytlsLogModal.status?.tlsSniMismatch || 0}/
+                      {anytlsLogModal.status?.tlsClientHello || 0} ({(
+                        (((anytlsLogModal.status?.tlsSniMismatch || 0) * 100) /
+                          Math.max(1, anytlsLogModal.status?.tlsClientHello || 0)) ||
+                        0
+                      ).toFixed(1)}%)
+                    </Chip>
+                    <Chip size="sm" variant="flat">
+                      转发错 {anytlsLogModal.status?.streamErr || 0}
+                    </Chip>
+                    <Chip size="sm" variant="flat">
+                      鉴权失败 {anytlsLogModal.status?.authFail || 0}
+                    </Chip>
+                    <Chip size="sm" variant="flat">
+                      读包错 {anytlsLogModal.status?.readErr || 0}
+                    </Chip>
+                    <Chip size="sm" variant="flat">
+                      出口错 {anytlsLogModal.status?.outboundErr || 0}
+                    </Chip>
+                  </div>
+                  <Button
+                    isLoading={anytlsLogModal.loading}
+                    size="sm"
+                    variant="flat"
+                    onPress={() => {
+                      if (!anytlsLogModal.nodeId) return;
+                      void loadAnyTLSRuntimeLogs(anytlsLogModal.nodeId);
+                    }}
+                  >
+                    刷新
+                  </Button>
+                </div>
+                {anytlsLogModal.loading ? (
+                  <div className="py-8 flex justify-center">
+                    <Spinner size="sm" />
+                  </div>
+                ) : anytlsLogModal.logs.length === 0 ? (
+                  <div className="text-sm text-default-500 py-6 text-center">
+                    暂无 AnyTLS 运行日志
+                  </div>
+	                ) : (
+	                  <div className="space-y-2 max-h-[58vh] overflow-y-auto">
+	                    {anytlsLogModal.logs.map((it) => {
+	                      const step = String(it.cmd || "").replace(/^OpLog:/, "");
+	                      let parsed: any = null;
+	                      if (it.stdout) {
+	                        try {
+	                          parsed = JSON.parse(String(it.stdout));
+	                        } catch {
+	                          parsed = null;
+	                        }
+	                      }
+	                      const detailLine =
+	                        parsed && typeof parsed === "object"
+	                          ? [
+	                              parsed.stage ? `stage=${parsed.stage}` : "",
+	                              parsed.kind ? `kind=${parsed.kind}` : "",
+	                              parsed.errorType ? `type=${parsed.errorType}` : "",
+	                              parsed.network ? `network=${parsed.network}` : "",
+	                              parsed.op ? `op=${parsed.op}` : "",
+	                              parsed.local ? `local=${parsed.local}` : "",
+	                              parsed.remote ? `remote=${parsed.remote}` : "",
+	                              parsed.destination
+	                                ? `destination=${parsed.destination}`
+	                                : "",
+	                              typeof parsed.timeout === "boolean"
+	                                ? `timeout=${String(parsed.timeout)}`
+	                                : "",
+	                            ]
+	                              .filter(Boolean)
+	                              .join(" · ")
+	                          : "";
+	                      return (
+	                        <div
+	                          key={`anytls-log-${it.id}`}
+	                          className="rounded-lg border border-default-200 p-2"
+	                        >
+                          <div className="text-xs text-default-500 mb-1">
+                            {it.timeMs
+                              ? new Date(it.timeMs).toLocaleString()
+                              : "-"}
+                            {step ? ` · ${step}` : ""}
+                          </div>
+	                          <div className="text-sm break-all">
+	                            {it.message || "-"}
+	                          </div>
+	                          {parsed?.error ? (
+	                            <div className="mt-1 text-xs text-danger break-all">
+	                              错误：{String(parsed.error)}
+	                            </div>
+	                          ) : null}
+	                          {detailLine ? (
+	                            <div className="mt-1 text-[11px] text-default-500 break-all">
+	                              {detailLine}
+	                            </div>
+	                          ) : null}
+	                          {it.stderr ? (
+	                            <pre className="mt-2 text-xs bg-danger-50 rounded p-2 overflow-x-auto whitespace-pre-wrap break-all">
+	                              {it.stderr}
+	                            </pre>
+	                          ) : null}
+                          {it.stdout ? (
+                            <pre className="mt-2 text-xs bg-default-100 rounded p-2 overflow-x-auto whitespace-pre-wrap break-all">
+                              {it.stdout}
+                            </pre>
+                          ) : null}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
               </ModalBody>
               <ModalFooter>
                 <Button variant="light" onPress={onClose}>
@@ -3823,6 +5689,15 @@ export default function NodePage() {
               pid: "",
               loading: false,
             });
+            setPprofState({
+              enabled: false,
+              addr: "",
+              loading: false,
+              fetchLoading: false,
+              quickTesting: false,
+              content: "",
+              profile: "goroutine",
+            });
           }
           setSelfCheckModal((prev) => ({ ...prev, open }));
         }}
@@ -3935,6 +5810,185 @@ export default function NodePage() {
                       </Button>
                     )}
                   </div>
+                  {isAdmin && (
+                    <div className="space-y-2 pt-1">
+                      <div className="flex items-center gap-2 text-xs text-default-500">
+                        <span>Agent pprof：</span>
+                        <Chip
+                          size="sm"
+                          variant="flat"
+                          color={
+                            pprofState.loading
+                              ? "warning"
+                              : pprofState.enabled
+                                ? "success"
+                                : "default"
+                          }
+                        >
+                          {pprofState.loading
+                            ? "查询中"
+                            : pprofState.enabled
+                              ? "已开启"
+                              : "未开启"}
+                        </Chip>
+                        {pprofState.addr ? (
+                          <Chip size="sm" variant="flat">
+                            {pprofState.addr}
+                          </Chip>
+                        ) : null}
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        <Button
+                          size="sm"
+                          variant="flat"
+                          color="success"
+                          isDisabled={
+                            pprofState.loading ||
+                            pprofState.quickTesting ||
+                            pprofState.enabled
+                          }
+                          onPress={() => handlePprofControl("enable")}
+                        >
+                          开启 pprof
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="flat"
+                          color="default"
+                          isDisabled={
+                            pprofState.loading ||
+                            pprofState.quickTesting ||
+                            !pprofState.enabled
+                          }
+                          onPress={() => handlePprofControl("disable")}
+                        >
+                          关闭 pprof
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="flat"
+                          color="primary"
+                          isLoading={
+                            pprofState.fetchLoading &&
+                            pprofState.profile === "goroutine"
+                          }
+                          isDisabled={
+                            !pprofState.enabled ||
+                            pprofState.loading ||
+                            pprofState.quickTesting
+                          }
+                          onPress={() => handlePprofFetch("goroutine")}
+                        >
+                          查看 Goroutine
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="flat"
+                          color="secondary"
+                          isLoading={
+                            pprofState.fetchLoading && pprofState.profile === "heap"
+                          }
+                          isDisabled={
+                            !pprofState.enabled ||
+                            pprofState.loading ||
+                            pprofState.quickTesting
+                          }
+                          onPress={() => handlePprofFetch("heap")}
+                        >
+                          查看 Heap
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="flat"
+                          color="warning"
+                          isLoading={
+                            pprofState.fetchLoading && pprofState.profile === "mutex"
+                          }
+                          isDisabled={
+                            !pprofState.enabled ||
+                            pprofState.loading ||
+                            pprofState.quickTesting
+                          }
+                          onPress={() => handlePprofFetch("mutex")}
+                        >
+                          查看 Mutex
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="flat"
+                          color="warning"
+                          isLoading={
+                            pprofState.fetchLoading && pprofState.profile === "block"
+                          }
+                          isDisabled={
+                            !pprofState.enabled ||
+                            pprofState.loading ||
+                            pprofState.quickTesting
+                          }
+                          onPress={() => handlePprofFetch("block")}
+                        >
+                          查看 Block
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="flat"
+                          color="warning"
+                          isLoading={
+                            pprofState.fetchLoading &&
+                            pprofState.profile === "threadcreate"
+                          }
+                          isDisabled={
+                            !pprofState.enabled ||
+                            pprofState.loading ||
+                            pprofState.quickTesting
+                          }
+                          onPress={() => handlePprofFetch("threadcreate")}
+                        >
+                          查看 ThreadCreate
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="flat"
+                          color="danger"
+                          isLoading={pprofState.quickTesting}
+                          isDisabled={pprofState.loading || pprofState.fetchLoading}
+                          onPress={handlePprofQuickTest}
+                        >
+                          一键回归测试
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="flat"
+                          color="primary"
+                          isDisabled={!pprofState.content || pprofState.fetchLoading}
+                          onPress={copyPprofReport}
+                        >
+                          复制报告
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="light"
+                          isDisabled={pprofState.loading || pprofState.quickTesting}
+                          onPress={() => {
+                            if (selfCheckModal.nodeId) {
+                              refreshPprofStatus(selfCheckModal.nodeId);
+                            }
+                          }}
+                        >
+                          刷新状态
+                        </Button>
+                      </div>
+                      <Textarea
+                        readOnly
+                        minRows={6}
+                        className="font-mono text-xs"
+                        value={
+                          pprofState.content ||
+                          (pprofState.fetchLoading ? "拉取中..." : "暂无 pprof 输出")
+                        }
+                      />
+                    </div>
+                  )}
                   <Textarea
                     readOnly
                     minRows={6}

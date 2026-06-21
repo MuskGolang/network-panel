@@ -36,6 +36,7 @@ var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { retu
 type nodeConn struct {
 	c   *websocket.Conn
 	ver string
+	mu  sync.Mutex
 }
 
 // adminClient wraps an admin websocket connection with a write mutex
@@ -49,6 +50,15 @@ type adminClient struct {
 type terminalClient struct {
 	c  *websocket.Conn
 	mu sync.Mutex
+}
+
+// safeWriteMessage writes a text message to node connection with locking and deadline.
+func (n *nodeConn) safeWriteMessage(b []byte) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	// Keep per-node command dispatch bounded to avoid batch API timeout.
+	_ = n.c.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	return n.c.WriteMessage(websocket.TextMessage, b)
 }
 
 // safeWriteMessage writes a text message to admin client with locking and deadline.
@@ -364,7 +374,7 @@ func SystemInfoWS(c *gin.Context) {
 						}
 						continue
 					}
-				} else if ok && (t == "RunScriptResult" || t == "WriteFileResult" || t == "RestartServiceResult" || t == "StopServiceResult" || t == "AddServiceResult" || t == "SetAnyTLSResult") {
+				} else if ok && (t == "RunScriptResult" || t == "WriteFileResult" || t == "RestartServiceResult" || t == "StopServiceResult" || t == "AddServiceResult" || t == "SetAnyTLSResult" || t == "SetEdgeTLSResult" || t == "PprofControlResult" || t == "PprofFetchResult") {
 					if reqID, ok := generic["requestId"].(string); ok {
 						opMu.Lock()
 						ch := opWaiters[reqID]
@@ -373,6 +383,10 @@ func SystemInfoWS(c *gin.Context) {
 						// persist to node_op_log
 						var nid int64 = node.ID
 						okFlag := 0
+						cmdType := t
+						if t == "SetAnyTLSResult" || t == "SetEdgeTLSResult" {
+							cmdType = "SetEdgeTLSResult"
+						}
 						if data, _ := generic["data"].(map[string]interface{}); data != nil {
 							if s, _ := data["success"].(bool); s {
 								okFlag = 1
@@ -387,9 +401,9 @@ func SystemInfoWS(c *gin.Context) {
 							if se != "" {
 								sePtr = &se
 							}
-							enqueueOpLog(model.NodeOpLog{TimeMs: time.Now().UnixMilli(), NodeID: nid, Cmd: t, RequestID: reqID, Success: okFlag, Message: msg, Stdout: soPtr, Stderr: sePtr})
+							enqueueOpLog(model.NodeOpLog{TimeMs: time.Now().UnixMilli(), NodeID: nid, Cmd: cmdType, RequestID: reqID, Success: okFlag, Message: msg, Stdout: soPtr, Stderr: sePtr})
 						} else {
-							enqueueOpLog(model.NodeOpLog{TimeMs: time.Now().UnixMilli(), NodeID: nid, Cmd: t, RequestID: reqID, Success: okFlag, Message: "no data"})
+							enqueueOpLog(model.NodeOpLog{TimeMs: time.Now().UnixMilli(), NodeID: nid, Cmd: cmdType, RequestID: reqID, Success: okFlag, Message: "no data"})
 						}
 						if ch != nil {
 							select {
@@ -408,12 +422,44 @@ func SystemInfoWS(c *gin.Context) {
 					if m, _ := generic["message"].(string); m != "" {
 						msg = m
 					}
+					var soPtr *string
 					if data, _ := generic["data"].(map[string]interface{}); data != nil {
 						if s, _ := data["message"].(string); s != "" {
 							msg = s
 						}
+						if b, err := json.Marshal(data); err == nil {
+							raw := string(b)
+							soPtr = &raw
+						}
 					}
-					enqueueOpLog(model.NodeOpLog{TimeMs: time.Now().UnixMilli(), NodeID: nid, Cmd: "OpLog:" + step, RequestID: "", Success: 1, Message: msg})
+					enqueueOpLog(model.NodeOpLog{
+						TimeMs:    time.Now().UnixMilli(),
+						NodeID:    nid,
+						Cmd:       "OpLog:" + step,
+						RequestID: "",
+						Success:   1,
+						Message:   msg,
+						Stdout:    soPtr,
+					})
+				} else if ok && (t == "AnyTLSCertLog" || t == "TLSCertLog") {
+					// Dedicated TLS certificate install/refresh logs from agent.
+					var nid int64 = node.ID
+					step, _ := generic["step"].(string)
+					msg, _ := generic["message"].(string)
+					dataRaw := ""
+					if data, exists := generic["data"]; exists {
+						if b, err := json.Marshal(data); err == nil {
+							dataRaw = string(b)
+						}
+					}
+					rec := model.NodeAnyTLSCertLog{
+						TimeMs:  time.Now().UnixMilli(),
+						NodeID:  nid,
+						Step:    strings.TrimSpace(step),
+						Message: strings.TrimSpace(msg),
+						Data:    dataRaw,
+					}
+					_ = dbpkg.DB.Create(&rec).Error
 				} else {
 					// Other JSON payload received (debug)
 					jlog(map[string]interface{}{"event": "node_unknown_json", "nodeId": node.ID, "payload": string(msg)})
@@ -491,7 +537,7 @@ func sendWSCommand(nodeID int64, cmdType string, data interface{}) error {
 			target = list[len(list)-1]
 		}
 		jlog(map[string]interface{}{"event": "ws_send", "cmd": cmdType, "nodeId": nodeID, "version": target.ver, "payload": string(b)})
-		return target.c.WriteMessage(websocket.TextMessage, b)
+		return target.safeWriteMessage(b)
 	}
 
 	// Service mutations: broadcast to all connections for reliability
@@ -501,7 +547,7 @@ func sendWSCommand(nodeID int64, cmdType string, data interface{}) error {
 		if nc == nil || nc.c == nil {
 			continue
 		}
-		if err := nc.c.WriteMessage(websocket.TextMessage, b); err != nil {
+		if err := nc.safeWriteMessage(b); err != nil {
 			writeErr = err
 			jlog(map[string]interface{}{"event": "ws_send_err", "cmd": cmdType, "nodeId": nodeID, "version": nc.ver, "error": err.Error()})
 			continue
@@ -1185,6 +1231,57 @@ func convertSysInfoJSON(b []byte) map[string]interface{} {
 	} else if v, ok := in["iperf3_pid"]; ok {
 		out["iperf3_pid"] = v
 	}
+	// agent process runtime metrics (self memory/gc/goroutines)
+	if v, ok := in["AgentHeapAllocMB"]; ok {
+		out["agent_heap_alloc_mb"] = v
+	} else if v, ok := in["agent_heap_alloc_mb"]; ok {
+		out["agent_heap_alloc_mb"] = v
+	}
+	if v, ok := in["AgentHeapInuseMB"]; ok {
+		out["agent_heap_inuse_mb"] = v
+	} else if v, ok := in["agent_heap_inuse_mb"]; ok {
+		out["agent_heap_inuse_mb"] = v
+	}
+	if v, ok := in["AgentStackInuseMB"]; ok {
+		out["agent_stack_inuse_mb"] = v
+	} else if v, ok := in["agent_stack_inuse_mb"]; ok {
+		out["agent_stack_inuse_mb"] = v
+	}
+	if v, ok := in["AgentSysMB"]; ok {
+		out["agent_sys_mb"] = v
+	} else if v, ok := in["agent_sys_mb"]; ok {
+		out["agent_sys_mb"] = v
+	}
+	if v, ok := in["AgentRSSMB"]; ok {
+		out["agent_rss_mb"] = v
+	} else if v, ok := in["agent_rss_mb"]; ok {
+		out["agent_rss_mb"] = v
+	}
+	if v, ok := in["AgentNumGC"]; ok {
+		out["agent_num_gc"] = v
+	} else if v, ok := in["agent_num_gc"]; ok {
+		out["agent_num_gc"] = v
+	}
+	if v, ok := in["AgentLastGCPauseMs"]; ok {
+		out["agent_last_gc_pause_ms"] = v
+	} else if v, ok := in["agent_last_gc_pause_ms"]; ok {
+		out["agent_last_gc_pause_ms"] = v
+	}
+	if v, ok := in["AgentGCCPUPercent"]; ok {
+		out["agent_gc_cpu_percent"] = v
+	} else if v, ok := in["agent_gc_cpu_percent"]; ok {
+		out["agent_gc_cpu_percent"] = v
+	}
+	if v, ok := in["AgentGoRoutines"]; ok {
+		out["agent_go_routines"] = v
+	} else if v, ok := in["agent_go_routines"]; ok {
+		out["agent_go_routines"] = v
+	}
+	if v, ok := in["AgentMemCollectedAtMs"]; ok {
+		out["agent_mem_collected_at_ms"] = v
+	} else if v, ok := in["agent_mem_collected_at_ms"]; ok {
+		out["agent_mem_collected_at_ms"] = v
+	}
 	return out
 }
 
@@ -1228,6 +1325,22 @@ func storeSysInfoSample(nodeID int64, m map[string]interface{}) {
 		}
 		return 0
 	}
+	toFloatPtr := func(v any) *float64 {
+		switch v.(type) {
+		case nil:
+			return nil
+		}
+		f := toFloat(v)
+		return &f
+	}
+	toInt64Ptr := func(v any) *int64 {
+		switch v.(type) {
+		case nil:
+			return nil
+		}
+		i := toInt64(v)
+		return &i
+	}
 	now := time.Now().UnixMilli()
 	shouldStore := true
 	if sysinfoStoreInterval > 0 {
@@ -1242,13 +1355,22 @@ func storeSysInfoSample(nodeID int64, m map[string]interface{}) {
 	}
 	if shouldStore {
 		s := model.NodeSysInfo{
-			NodeID:  nodeID,
-			TimeMs:  now,
-			Uptime:  toInt64(m["uptime"]),
-			BytesRx: toInt64(m["bytes_received"]),
-			BytesTx: toInt64(m["bytes_transmitted"]),
-			CPU:     toFloat(m["cpu_usage"]),
-			Mem:     toFloat(m["memory_usage"]),
+			NodeID:             nodeID,
+			TimeMs:             now,
+			Uptime:             toInt64(m["uptime"]),
+			BytesRx:            toInt64(m["bytes_received"]),
+			BytesTx:            toInt64(m["bytes_transmitted"]),
+			CPU:                toFloat(m["cpu_usage"]),
+			Mem:                toFloat(m["memory_usage"]),
+			AgentHeapAllocMB:   toFloatPtr(m["agent_heap_alloc_mb"]),
+			AgentHeapInuseMB:   toFloatPtr(m["agent_heap_inuse_mb"]),
+			AgentStackInuseMB:  toFloatPtr(m["agent_stack_inuse_mb"]),
+			AgentSysMB:         toFloatPtr(m["agent_sys_mb"]),
+			AgentRSSMB:         toFloatPtr(m["agent_rss_mb"]),
+			AgentNumGC:         toInt64Ptr(m["agent_num_gc"]),
+			AgentLastGCPauseMS: toFloatPtr(m["agent_last_gc_pause_ms"]),
+			AgentGCCPUPercent:  toFloatPtr(m["agent_gc_cpu_percent"]),
+			AgentGoRoutines:    toInt64Ptr(m["agent_go_routines"]),
 		}
 		enqueueSysInfo(s)
 	}

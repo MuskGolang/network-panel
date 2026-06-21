@@ -14,18 +14,19 @@ import (
 )
 
 type exitNodeItem struct {
-	Source      string  `json:"source"`
-	NodeID      *int64  `json:"nodeId,omitempty"`
-	ExitID      *int64  `json:"exitId,omitempty"`
-	Name        string  `json:"name"`
-	Host        string  `json:"host"`
-	Online      bool    `json:"online"`
-	SSPort      *int    `json:"ssPort,omitempty"`
-	AnyTLSPort  *int    `json:"anytlsPort,omitempty"`
-	AnyTLSExitIP *string `json:"anytlsExitIp,omitempty"`
-	Protocol    *string `json:"protocol,omitempty"`
-	Port        *int    `json:"port,omitempty"`
-	Config      json.RawMessage `json:"config,omitempty"`
+	Source       string              `json:"source"`
+	NodeID       *int64              `json:"nodeId,omitempty"`
+	ExitID       *int64              `json:"exitId,omitempty"`
+	Name         string              `json:"name"`
+	Host         string              `json:"host"`
+	Online       bool                `json:"online"`
+	SSPort       *int                `json:"ssPort,omitempty"`
+	AnyTLSPort   *int                `json:"anytlsPort,omitempty"`
+	AnyTLSPorts  []anyTLSPortMapping `json:"anytlsPorts,omitempty"`
+	AnyTLSExitIP *string             `json:"anytlsExitIp,omitempty"`
+	Protocol     *string             `json:"protocol,omitempty"`
+	Port         *int                `json:"port,omitempty"`
+	Config       json.RawMessage     `json:"config,omitempty"`
 }
 
 // ExitNodeList lists internal exit nodes + external exit nodes
@@ -60,8 +61,39 @@ func ExitNodeList(c *gin.Context) {
 			exitMap[a.NodeID] = item
 		}
 		item.AnyTLSPort = intPtr(a.Port)
-		if v := getAnyTLSExitIP(a.NodeID); v != "" {
-			item.AnyTLSExitIP = strPtr(v)
+	}
+	var atPorts []model.AnyTLSPortEgress
+	_ = dbpkg.DB.Order("node_id asc, port asc").Find(&atPorts).Error
+	for _, p := range atPorts {
+		item := exitMap[p.NodeID]
+		if item == nil {
+			id := p.NodeID
+			item = &exitNodeItem{Source: "node", NodeID: &id, Online: false}
+			exitMap[p.NodeID] = item
+		}
+		exitIP := ""
+		if p.EgressIP != nil {
+			exitIP = strings.TrimSpace(*p.EgressIP)
+		}
+		item.AnyTLSPorts = append(item.AnyTLSPorts, anyTLSPortMapping{
+			Port:   p.Port,
+			ExitIP: exitIP,
+		})
+	}
+	for _, item := range exitMap {
+		if len(item.AnyTLSPorts) > 0 {
+			if item.AnyTLSPort == nil || *item.AnyTLSPort <= 0 {
+				item.AnyTLSPort = intPtr(item.AnyTLSPorts[0].Port)
+			}
+			if item.AnyTLSExitIP == nil {
+				if v := strings.TrimSpace(item.AnyTLSPorts[0].ExitIP); v != "" {
+					item.AnyTLSExitIP = strPtr(v)
+				}
+			}
+		} else if item.NodeID != nil {
+			if v := getAnyTLSExitIP(*item.NodeID); v != "" {
+				item.AnyTLSExitIP = strPtr(v)
+			}
 		}
 	}
 
@@ -91,6 +123,7 @@ func ExitNodeList(c *gin.Context) {
 		if len(staleIDs) > 0 {
 			dbpkg.DB.Where("node_id IN ?", staleIDs).Delete(&model.ExitSetting{})
 			dbpkg.DB.Where("node_id IN ?", staleIDs).Delete(&model.AnyTLSSetting{})
+			dbpkg.DB.Where("node_id IN ?", staleIDs).Delete(&model.AnyTLSPortEgress{})
 		}
 	}
 
@@ -171,6 +204,13 @@ func ExitCleanup(c *gin.Context) {
 			staleSet[id] = struct{}{}
 		}
 	}
+	var anyTLSPortIDs []int64
+	dbpkg.DB.Model(&model.AnyTLSPortEgress{}).Select("distinct node_id").Pluck("node_id", &anyTLSPortIDs)
+	for _, id := range anyTLSPortIDs {
+		if _, ok := nodeSet[id]; !ok {
+			staleSet[id] = struct{}{}
+		}
+	}
 
 	if len(staleSet) == 0 {
 		c.JSON(http.StatusOK, response.Ok(map[string]interface{}{
@@ -185,6 +225,7 @@ func ExitCleanup(c *gin.Context) {
 	}
 	resExit := dbpkg.DB.Where("node_id IN ?", staleIDs).Delete(&model.ExitSetting{})
 	resAny := dbpkg.DB.Where("node_id IN ?", staleIDs).Delete(&model.AnyTLSSetting{})
+	_ = dbpkg.DB.Where("node_id IN ?", staleIDs).Delete(&model.AnyTLSPortEgress{}).Error
 	c.JSON(http.StatusOK, response.Ok(map[string]interface{}{
 		"deletedExit":   resExit.RowsAffected,
 		"deletedAnyTLS": resAny.RowsAffected,

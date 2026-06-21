@@ -192,8 +192,8 @@ type SwaggerTunnelIDReq struct {
 }
 
 type SwaggerTunnelPathSetReq struct {
-	TunnelID int64   `json:"tunnelId" example:"1"`
-	Path     []int64 `json:"path" swaggertype:"array,integer" example:"2,3"`
+	TunnelID  int64    `json:"tunnelId" example:"1"`
+	Path      []int64  `json:"path" swaggertype:"array,integer" example:"2,3"`
 	LinkModes []string `json:"linkModes" swaggertype:"array,string" example:"direct,tunnel"`
 }
 
@@ -244,19 +244,19 @@ type SwaggerNodeCreateReq = dto.NodeDto
 type SwaggerNodeUpdateReq = dto.NodeUpdateDto
 
 type SwaggerNodeExitReq struct {
-	NodeID    int64    `json:"nodeId" example:"1"`
-	Type      string   `json:"type" example:"ss"`
-	Port      int      `json:"port" example:"10000"`
-	Password  string   `json:"password" example:"pass"`
-	Method    string   `json:"method" example:"AEAD_CHACHA20_POLY1305"`
-	ExitIP    string   `json:"exitIp,omitempty" example:"1.2.3.4"`
-	AllowFallback *bool `json:"allowFallback,omitempty" example:"true"`
-	Observer  *string  `json:"observer" example:"console"`
-	Limiter   *string  `json:"limiter" example:"5mbps"`
-	RLimiter  *string  `json:"rlimiter" example:""`
-	Metadata  *string  `json:"metadata" example:"{\"k\":\"v\"}"`
-	Ifaces    []string `json:"ifaces,omitempty"`
-	Interface string   `json:"interface,omitempty"`
+	NodeID        int64    `json:"nodeId" example:"1"`
+	Type          string   `json:"type" example:"ss"`
+	Port          int      `json:"port" example:"10000"`
+	Password      string   `json:"password" example:"pass"`
+	Method        string   `json:"method" example:"AEAD_CHACHA20_POLY1305"`
+	ExitIP        string   `json:"exitIp,omitempty" example:"1.2.3.4"`
+	AllowFallback *bool    `json:"allowFallback,omitempty" example:"true"`
+	Observer      *string  `json:"observer" example:"console"`
+	Limiter       *string  `json:"limiter" example:"5mbps"`
+	RLimiter      *string  `json:"rlimiter" example:""`
+	Metadata      *string  `json:"metadata" example:"{\"k\":\"v\"}"`
+	Ifaces        []string `json:"ifaces,omitempty"`
+	Interface     string   `json:"interface,omitempty"`
 }
 
 type SwaggerNodeInstallReq struct {
@@ -282,6 +282,11 @@ type SwaggerNodeDeleteReq struct {
 
 type SwaggerNodeSimpleReq struct {
 	NodeID int64 `json:"nodeId" example:"1"`
+}
+
+type SwaggerNodeEnableGostAPIReq struct {
+	NodeID int64 `json:"nodeId" example:"1"`
+	Port   int   `json:"port,omitempty" example:"18080"`
 }
 
 type SwaggerNodeRangeReq struct {

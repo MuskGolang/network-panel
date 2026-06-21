@@ -646,9 +646,15 @@ html, body {
 }
 
 .node-card {
-  content-visibility: visible;
-  contain: none;
-  contain-intrinsic-size: auto;
+  content-visibility: auto;
+  contain: layout paint style;
+  contain-intrinsic-size: 560px 720px;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.node-card .font-mono {
+  overflow-wrap: anywhere;
 }
 
 .node-card-offline {
@@ -662,6 +668,32 @@ html, body {
 .node-card-offline .np-soft {
   background: rgba(245, 245, 245, 0.65);
   border-color: rgba(220, 220, 220, 0.6);
+}
+
+@media (max-width: 640px) {
+  .np-page {
+    padding: 12px 10px calc(18px + var(--safe-area-bottom));
+    gap: 10px;
+  }
+
+  .np-page-header {
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+
+  .np-page-header > * {
+    min-width: 0;
+  }
+
+  .node-card {
+    border-radius: 14px;
+    contain-intrinsic-size: 420px 760px;
+  }
+
+  .node-card [data-slot="base"] {
+    min-width: 0;
+  }
 }
 
 .skeleton-card {

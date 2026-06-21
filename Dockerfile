@@ -41,7 +41,9 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -mod=vendor -buildv
 # --- Final runtime ---
 FROM debian:12-slim AS final
 WORKDIR /app
-ENV PORT=6365
+ENV PORT=6365 \
+    ANYTLS_CERT_DIR=/app/data/anytls
+COPY --from=be /etc/ssl/certs/ /etc/ssl/certs/
 
 # 不在运行期做 apk add，避免同类问题（若应用需要 HTTPS 出站，建议单独准备带 CA 的基础镜像或手动拷贝证书）
 COPY --from=be /app/server /app/server
@@ -68,12 +70,10 @@ CMD ["/app/launcher"]
 
 # --- Final runtime (use local prebuilt frontend) ---
 FROM debian:12-slim AS final-local
-
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
-
 WORKDIR /app
-ENV PORT=6365
+ENV PORT=6365 \
+    ANYTLS_CERT_DIR=/app/data/anytls
+COPY --from=be /etc/ssl/certs/ /etc/ssl/certs/
 
 COPY --from=be /app/server /app/server
 COPY --from=be /app/launcher /app/launcher

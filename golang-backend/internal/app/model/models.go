@@ -72,6 +72,7 @@ type Forward struct {
 	InPort        int     `gorm:"column:in_port" json:"inPort"`
 	OutPort       *int    `gorm:"column:out_port" json:"outPort,omitempty"`
 	RemoteAddr    string  `gorm:"column:remote_addr" json:"remoteAddr"`
+	EgressesRaw   string  `gorm:"column:egresses;type:text" json:"-"`
 	InterfaceName *string `gorm:"column:interface_name" json:"interfaceName,omitempty"`
 	Strategy      *string `gorm:"column:strategy" json:"strategy,omitempty"`
 	InFlow        int64   `gorm:"column:in_flow" json:"inFlow"`
@@ -150,14 +151,14 @@ func (StatisticsFlow) TableName() string { return "statistics_flow" }
 
 // FlowTimeseries stores per-report flow increments for accurate charts
 type FlowTimeseries struct {
-	ID          int64 `gorm:"primaryKey;column:id" json:"id"`
-	UserID      int64 `gorm:"column:user_id" json:"userId"`
-	InBytes     int64 `gorm:"column:in_bytes" json:"inBytes"`
-	OutBytes    int64 `gorm:"column:out_bytes" json:"outBytes"`
-	BilledBytes int64 `gorm:"column:billed_bytes" json:"billedBytes"` // single/dual directional accounted bytes
+	ID          int64  `gorm:"primaryKey;column:id" json:"id"`
+	UserID      int64  `gorm:"column:user_id" json:"userId"`
+	InBytes     int64  `gorm:"column:in_bytes" json:"inBytes"`
+	OutBytes    int64  `gorm:"column:out_bytes" json:"outBytes"`
+	BilledBytes int64  `gorm:"column:billed_bytes" json:"billedBytes"` // single/dual directional accounted bytes
 	Source      string `gorm:"column:source;type:varchar(16)" json:"source"`
-	TimeMs      int64 `gorm:"column:time_ms" json:"timeMs"`
-	CreatedTime int64 `gorm:"column:created_time" json:"createdTime"`
+	TimeMs      int64  `gorm:"column:time_ms" json:"timeMs"`
+	CreatedTime int64  `gorm:"column:created_time" json:"createdTime"`
 }
 
 func (FlowTimeseries) TableName() string { return "flow_timeseries" }
@@ -224,17 +225,29 @@ type NodeOpLog struct {
 
 func (NodeOpLog) TableName() string { return "node_op_log" }
 
+// NodeAnyTLSCertLog stores dedicated AnyTLS certificate install/refresh logs from agent.
+type NodeAnyTLSCertLog struct {
+	ID      int64  `gorm:"primaryKey;column:id" json:"id"`
+	TimeMs  int64  `gorm:"column:time_ms" json:"timeMs"`
+	NodeID  int64  `gorm:"column:node_id" json:"nodeId"`
+	Step    string `gorm:"column:step" json:"step"`
+	Message string `gorm:"column:message" json:"message"`
+	Data    string `gorm:"column:data;type:longtext" json:"data"`
+}
+
+func (NodeAnyTLSCertLog) TableName() string { return "node_anytls_cert_log" }
+
 // ExitSetting persists the last configured SS exit settings per node
 type ExitSetting struct {
 	BaseEntity
-	NodeID   int64   `gorm:"column:node_id;uniqueIndex" json:"nodeId"`
-	Port     int     `gorm:"column:port" json:"port"`
-	Password string  `gorm:"column:password" json:"password"`
-	Method   string  `gorm:"column:method" json:"method"`
-	Observer *string `gorm:"column:observer" json:"observer,omitempty"`
-	Limiter  *string `gorm:"column:limiter" json:"limiter,omitempty"`
-	RLimiter *string `gorm:"column:rlimiter" json:"rlimiter,omitempty"`
-	BaseUserID *int64 `gorm:"column:base_user_id" json:"baseUserId,omitempty"`
+	NodeID     int64   `gorm:"column:node_id;uniqueIndex" json:"nodeId"`
+	Port       int     `gorm:"column:port" json:"port"`
+	Password   string  `gorm:"column:password" json:"password"`
+	Method     string  `gorm:"column:method" json:"method"`
+	Observer   *string `gorm:"column:observer" json:"observer,omitempty"`
+	Limiter    *string `gorm:"column:limiter" json:"limiter,omitempty"`
+	RLimiter   *string `gorm:"column:rlimiter" json:"rlimiter,omitempty"`
+	BaseUserID *int64  `gorm:"column:base_user_id" json:"baseUserId,omitempty"`
 	// Metadata is a JSON string storing arbitrary key-values for handler.metadata
 	Metadata *string `gorm:"column:metadata" json:"metadata,omitempty"`
 }
@@ -244,13 +257,24 @@ func (ExitSetting) TableName() string { return "exit_setting" }
 // AnyTLSSetting persists AnyTLS exit settings per node
 type AnyTLSSetting struct {
 	BaseEntity
-	NodeID     int64 `gorm:"column:node_id;uniqueIndex" json:"nodeId"`
-	Port       int   `gorm:"column:port" json:"port"`
+	NodeID     int64  `gorm:"column:node_id;uniqueIndex" json:"nodeId"`
+	Port       int    `gorm:"column:port" json:"port"`
 	Password   string `gorm:"column:password" json:"password"`
 	BaseUserID *int64 `gorm:"column:base_user_id" json:"baseUserId,omitempty"`
 }
 
 func (AnyTLSSetting) TableName() string { return "anytls_setting" }
+
+// AnyTLSPortEgress stores per-node AnyTLS listening port to egress IP mapping.
+// One port maps to at most one egress IP; empty egress_ip means default route.
+type AnyTLSPortEgress struct {
+	BaseEntity
+	NodeID   int64   `gorm:"column:node_id;uniqueIndex:uniq_anytls_node_port,priority:1" json:"nodeId"`
+	Port     int     `gorm:"column:port;uniqueIndex:uniq_anytls_node_port,priority:2" json:"port"`
+	EgressIP *string `gorm:"column:egress_ip" json:"egressIp,omitempty"`
+}
+
+func (AnyTLSPortEgress) TableName() string { return "anytls_port_egress" }
 
 // ExitNodeExternal stores manually added exit nodes (non-agent)
 type ExitNodeExternal struct {
@@ -309,6 +333,16 @@ type NodeSysInfo struct {
 	BytesTx int64   `gorm:"column:bytes_tx" json:"bytesTx"`
 	CPU     float64 `gorm:"column:cpu" json:"cpu"`
 	Mem     float64 `gorm:"column:mem" json:"mem"`
+	// Agent self runtime metrics (optional; reported by newer flux-agent).
+	AgentHeapAllocMB   *float64 `gorm:"column:agent_heap_alloc_mb" json:"agentHeapAllocMb,omitempty"`
+	AgentHeapInuseMB   *float64 `gorm:"column:agent_heap_inuse_mb" json:"agentHeapInuseMb,omitempty"`
+	AgentStackInuseMB  *float64 `gorm:"column:agent_stack_inuse_mb" json:"agentStackInuseMb,omitempty"`
+	AgentSysMB         *float64 `gorm:"column:agent_sys_mb" json:"agentSysMb,omitempty"`
+	AgentRSSMB         *float64 `gorm:"column:agent_rss_mb" json:"agentRssMb,omitempty"`
+	AgentNumGC         *int64   `gorm:"column:agent_num_gc" json:"agentNumGc,omitempty"`
+	AgentLastGCPauseMS *float64 `gorm:"column:agent_last_gc_pause_ms" json:"agentLastGcPauseMs,omitempty"`
+	AgentGCCPUPercent  *float64 `gorm:"column:agent_gc_cpu_percent" json:"agentGcCpuPercent,omitempty"`
+	AgentGoRoutines    *int64   `gorm:"column:agent_go_routines" json:"agentGoRoutines,omitempty"`
 }
 
 func (NodeSysInfo) TableName() string { return "node_sysinfo" }

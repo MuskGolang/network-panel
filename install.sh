@@ -7,9 +7,77 @@ GITHUB_DL_BASE="https://github.com/NiuStar/network-panel/releases/latest/downloa
 # GOST 最新版本 API（自动匹配资产）
 BASE_GOST_REPO_API="https://api.github.com/repos/go-gost/gost/releases/latest"
 PROXY_PREFIX=""
+FORCE_PROXY_GITHUB=0
 # 下载源模式：global(默认) | cn | static | github | auto(等价于 global)
 SOURCE_MODE="global"
 SOURCE_DESC=""
+CURL_CONNECT_TIMEOUT=${CURL_CONNECT_TIMEOUT:-8}
+CURL_MAX_TIME=${CURL_MAX_TIME:-45}
+CURL_RETRY=${CURL_RETRY:-2}
+PKG_INSTALL_TIMEOUT=${PKG_INSTALL_TIMEOUT:-120}
+
+cmd_display() {
+  printf '%q ' "$@"
+}
+
+run_with_timeout() {
+  local seconds="$1"
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$seconds" "$@"
+  else
+    "$@"
+  fi
+}
+
+curl_download() {
+  local url="$1" target="$2"
+  echo "🌐 请求下载: $url"
+  curl -fSL \
+    --connect-timeout "$CURL_CONNECT_TIMEOUT" \
+    --max-time "$CURL_MAX_TIME" \
+    --retry "$CURL_RETRY" \
+    --retry-delay 1 \
+    --retry-connrefused \
+    "$url" -o "$target"
+}
+
+curl_text() {
+  local url="$1"
+  echo "🌐 请求接口: $url" >&2
+  curl -fsSL \
+    --connect-timeout "$CURL_CONNECT_TIMEOUT" \
+    --max-time "$CURL_MAX_TIME" \
+    --retry "$CURL_RETRY" \
+    --retry-delay 1 \
+    --retry-connrefused \
+    "$url"
+}
+
+curl_head_ok() {
+  local url="$1"
+  curl -fsI \
+    --connect-timeout "$CURL_CONNECT_TIMEOUT" \
+    --max-time 12 \
+    --retry 1 \
+    --retry-delay 1 \
+    "$url" >/dev/null 2>&1
+}
+
+pkg_run() {
+  local rc
+  echo "📦 执行: $(cmd_display "$@")"
+  run_with_timeout "$PKG_INSTALL_TIMEOUT" "$@"
+  rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    echo "✅ 命令完成: $(cmd_display "$@")"
+  elif [[ "$rc" -eq 124 ]]; then
+    echo "⚠️ 命令超时 ${PKG_INSTALL_TIMEOUT}s: $(cmd_display "$@")"
+  else
+    echo "⚠️ 命令失败($rc): $(cmd_display "$@")"
+  fi
+  return "$rc"
+}
 
 # 根据地域/参数决定下载源优先级
 init_source_mode() {
@@ -17,7 +85,7 @@ init_source_mode() {
   if [[ "$mode" == "auto" ]]; then mode="global"; fi
   case "$mode" in
     cn)
-      [[ -z "$PROXY_PREFIX" ]] && PROXY_PREFIX="https://proxy.529851.xyz/"
+      [[ -z "$PROXY_PREFIX" ]] && PROXY_PREFIX="https://proxy.199028.xyz/"
       SOURCE_DESC="静态镜像 > GitHub(代理) > GitHub(直连) > 面板"
       ;;
     panel)
@@ -75,14 +143,74 @@ build_candidate_urls() {
 # 依次尝试下载至目标
 download_from_urls() {
   local target="$1"; shift
-  local url
+  local url try_url
   for url in "$@"; do
     [[ -z "$url" ]] && continue
-    echo "尝试: $url"
-    if curl -fSL --retry 3 --retry-delay 1 "$url" -o "$target"; then
-      return 0
-    fi
+    while read -r try_url; do
+      [[ -z "$try_url" ]] && continue
+      echo "➡️ 尝试下载: $try_url"
+      if curl_download "$try_url" "$target"; then
+        echo "✅ 下载成功: $try_url"
+        return 0
+      else
+        echo "⚠️ 下载失败，切换下一个源: $try_url"
+      fi
+    done < <(expand_github_urls "$url")
   done
+  return 1
+}
+
+# 判断是否为 GitHub 相关地址（可走 -p 代理前缀）
+is_github_related_url() {
+  local u="$1"
+  case "$u" in
+    https://github.com/*|http://github.com/*|\
+    https://api.github.com/*|http://api.github.com/*|\
+    https://raw.githubusercontent.com/*|http://raw.githubusercontent.com/*|\
+    https://objects.githubusercontent.com/*|http://objects.githubusercontent.com/*|\
+    https://codeload.github.com/*|http://codeload.github.com/*|\
+    https://github-releases.githubusercontent.com/*|http://github-releases.githubusercontent.com/*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# 若传入 -p，则对 GitHub 相关地址自动给出“直连 + 代理”候选
+expand_github_urls() {
+  local u="$1"
+  local p=""
+  if [[ -n "$PROXY_PREFIX" ]] && is_github_related_url "$u"; then
+    p="${PROXY_PREFIX}${u}"
+    if [[ "$FORCE_PROXY_GITHUB" == "1" ]]; then
+      printf '%s\n' "$p"
+    elif [[ "$SOURCE_MODE" == "cn" || "$SOURCE_MODE" == "static" ]]; then
+      printf '%s\n%s\n' "$p" "$u"
+    else
+      printf '%s\n%s\n' "$u" "$p"
+    fi
+  else
+    printf '%s\n' "$u"
+  fi
+}
+
+# 探测 URL 可达，返回首个可达候选（支持 GitHub 代理展开）
+pick_reachable_url() {
+  local u="$1"
+  local t=""
+  while read -r t; do
+    [[ -z "$t" ]] && continue
+    echo "  - HEAD 探测: $t" >&2
+    if curl_head_ok "$t"; then
+      echo "  - 可用: $t" >&2
+      echo "$t"
+      return 0
+    else
+      echo "  - 不可用/超时: $t" >&2
+    fi
+  done < <(expand_github_urls "$u")
   return 1
 }
 
@@ -173,6 +301,8 @@ check_and_install_tcpkill() {
   if command -v tcpkill &> /dev/null; then
     return 0
   fi
+
+  echo "🔧 tcpkill 未安装，尝试安装 dsniff（最多 ${PKG_INSTALL_TIMEOUT}s，失败不影响主流程）..."
   
   # 检测操作系统类型
   OS_TYPE=$(uname -s)
@@ -205,32 +335,39 @@ check_and_install_tcpkill() {
   
   case $DISTRO in
     ubuntu|debian)
-      $SUDO_CMD apt update &> /dev/null
-      $SUDO_CMD apt install -y dsniff &> /dev/null
+      export DEBIAN_FRONTEND=noninteractive
+      pkg_run $SUDO_CMD apt-get update
+      pkg_run $SUDO_CMD apt-get install -y --no-install-recommends dsniff
       ;;
     centos|rhel|fedora)
       if command -v dnf &> /dev/null; then
-        $SUDO_CMD dnf install -y dsniff &> /dev/null
+        pkg_run $SUDO_CMD dnf install -y dsniff
       elif command -v yum &> /dev/null; then
-        $SUDO_CMD yum install -y dsniff &> /dev/null
+        pkg_run $SUDO_CMD yum install -y dsniff
       fi
       ;;
     alpine)
-      $SUDO_CMD apk add --no-cache dsniff &> /dev/null
+      pkg_run $SUDO_CMD apk add --no-cache dsniff
       ;;
     arch|manjaro)
-      $SUDO_CMD pacman -S --noconfirm dsniff &> /dev/null
+      pkg_run $SUDO_CMD pacman -S --noconfirm dsniff
       ;;
     opensuse*|sles)
-      $SUDO_CMD zypper install -y dsniff &> /dev/null
+      pkg_run $SUDO_CMD zypper --non-interactive install dsniff
       ;;
     gentoo)
-      $SUDO_CMD emerge --ask=n net-analyzer/dsniff &> /dev/null
+      pkg_run $SUDO_CMD emerge --ask=n net-analyzer/dsniff
       ;;
     void)
-      $SUDO_CMD xbps-install -Sy dsniff &> /dev/null
+      pkg_run $SUDO_CMD xbps-install -Sy dsniff
       ;;
   esac
+
+  if command -v tcpkill >/dev/null 2>&1; then
+    echo "✅ tcpkill 已可用"
+  else
+    echo "⚠️ tcpkill 未安装成功，继续安装 GOST"
+  fi
   
   return 0
 }
@@ -239,29 +376,32 @@ check_and_install_tcpkill() {
 check_and_install_diag_tools() {
   if [[ $EUID -ne 0 ]]; then SUDO_CMD="sudo"; else SUDO_CMD=""; fi
   if [ -f /etc/os-release ]; then . /etc/os-release; DISTRO=$ID; else DISTRO=""; fi
+  echo "🔧 检查诊断工具 nc/iperf3/jq（最多 ${PKG_INSTALL_TIMEOUT}s，失败不影响主流程）..."
   case $DISTRO in
     ubuntu|debian)
-      $SUDO_CMD apt update -y >/dev/null 2>&1 || true
-      $SUDO_CMD apt install -y netcat-openbsd iperf3 jq >/dev/null 2>&1 || true
+      export DEBIAN_FRONTEND=noninteractive
+      pkg_run $SUDO_CMD apt-get update || true
+      pkg_run $SUDO_CMD apt-get install -y --no-install-recommends netcat-openbsd iperf3 jq || true
       ;;
     centos|rhel|fedora)
       if command -v dnf >/dev/null 2>&1; then
-        $SUDO_CMD dnf install -y nmap-ncat iperf3 jq >/dev/null 2>&1 || true
+        pkg_run $SUDO_CMD dnf install -y nmap-ncat iperf3 jq || true
       else
-        $SUDO_CMD yum install -y nmap-ncat iperf3 jq >/dev/null 2>&1 || true
+        pkg_run $SUDO_CMD yum install -y nmap-ncat iperf3 jq || true
       fi
       ;;
     alpine)
-      $SUDO_CMD apk add --no-cache netcat-openbsd iperf3 jq >/dev/null 2>&1 || true
+      pkg_run $SUDO_CMD apk add --no-cache netcat-openbsd iperf3 jq || true
       ;;
     arch|manjaro)
-      $SUDO_CMD pacman -S --noconfirm gnu-netcat iperf3 jq >/dev/null 2>&1 || true
+      pkg_run $SUDO_CMD pacman -S --noconfirm gnu-netcat iperf3 jq || true
       ;;
     *)
       # best effort
       command -v nc >/dev/null 2>&1 || echo "⚠️ 请手动安装 netcat/iperf3/jq 以支持诊断"
       ;;
   esac
+  echo "✅ 诊断工具检查完成"
   # 禁用系统 iperf3 服务（如存在）
   if is_systemd && systemctl list-unit-files | grep -q '^iperf3\.service'; then
     $SUDO_CMD systemctl disable iperf3 >/dev/null 2>&1 || true
@@ -292,31 +432,40 @@ has_jq() {
 
 start_flux_agent_service() {
   if is_systemd; then
-    systemctl start flux-agent >/dev/null 2>&1 || true
+    echo "🔄 启动 flux-agent(systemd)..."
+    systemctl start flux-agent || true
   elif is_openrc; then
-    rc-service flux-agent start >/dev/null 2>&1 || true
+    echo "🔄 启动 flux-agent(OpenRC)..."
+    rc-service flux-agent start || true
   elif is_openwrt; then
-    /etc/init.d/flux-agent start >/dev/null 2>&1 || true
+    echo "🔄 启动 flux-agent(OpenWrt)..."
+    /etc/init.d/flux-agent start || true
   fi
 }
 
 restart_flux_agent_service() {
   if is_systemd; then
-    systemctl restart flux-agent >/dev/null 2>&1 || systemctl start flux-agent >/dev/null 2>&1 || true
+    echo "🔄 重启 flux-agent(systemd)..."
+    systemctl restart flux-agent || systemctl start flux-agent || true
   elif is_openrc; then
-    rc-service flux-agent restart >/dev/null 2>&1 || rc-service flux-agent start >/dev/null 2>&1 || true
+    echo "🔄 重启 flux-agent(OpenRC)..."
+    rc-service flux-agent restart || rc-service flux-agent start || true
   elif is_openwrt; then
-    /etc/init.d/flux-agent restart >/dev/null 2>&1 || /etc/init.d/flux-agent start >/dev/null 2>&1 || true
+    echo "🔄 重启 flux-agent(OpenWrt)..."
+    /etc/init.d/flux-agent restart || /etc/init.d/flux-agent start || true
   fi
 }
 
 enable_flux_agent_service() {
   if is_systemd; then
-    systemctl enable flux-agent >/dev/null 2>&1 || true
+    echo "⚙️ 设置 flux-agent 开机自启(systemd)..."
+    systemctl enable flux-agent || true
   elif is_openrc; then
-    rc-update add flux-agent default >/dev/null 2>&1 || true
+    echo "⚙️ 设置 flux-agent 开机自启(OpenRC)..."
+    rc-update add flux-agent default || true
   elif is_openwrt; then
-    /etc/init.d/flux-agent enable >/dev/null 2>&1 || true
+    echo "⚙️ 设置 flux-agent 开机自启(OpenWrt)..."
+    /etc/init.d/flux-agent enable || true
   fi
 }
 
@@ -332,31 +481,40 @@ disable_flux_agent_service() {
 
 start_gost_service() {
   if is_systemd; then
-    systemctl start gost >/dev/null 2>&1 || true
+    echo "🔄 启动 gost(systemd)..."
+    systemctl start gost || true
   elif is_openrc; then
-    rc-service gost start >/dev/null 2>&1 || true
+    echo "🔄 启动 gost(OpenRC)..."
+    rc-service gost start || true
   elif is_openwrt; then
-    /etc/init.d/gost start >/dev/null 2>&1 || true
+    echo "🔄 启动 gost(OpenWrt)..."
+    /etc/init.d/gost start || true
   fi
 }
 
 restart_gost_service() {
   if is_systemd; then
-    systemctl restart gost >/dev/null 2>&1 || systemctl start gost >/dev/null 2>&1 || true
+    echo "🔄 重启 gost(systemd)..."
+    systemctl restart gost || systemctl start gost || true
   elif is_openrc; then
-    rc-service gost restart >/dev/null 2>&1 || rc-service gost start >/dev/null 2>&1 || true
+    echo "🔄 重启 gost(OpenRC)..."
+    rc-service gost restart || rc-service gost start || true
   elif is_openwrt; then
-    /etc/init.d/gost restart >/dev/null 2>&1 || /etc/init.d/gost start >/dev/null 2>&1 || true
+    echo "🔄 重启 gost(OpenWrt)..."
+    /etc/init.d/gost restart || /etc/init.d/gost start || true
   fi
 }
 
 enable_gost_service() {
   if is_systemd; then
-    systemctl enable gost >/dev/null 2>&1 || true
+    echo "⚙️ 设置 gost 开机自启(systemd)..."
+    systemctl enable gost || true
   elif is_openrc; then
-    rc-update add gost default >/dev/null 2>&1 || true
+    echo "⚙️ 设置 gost 开机自启(OpenRC)..."
+    rc-update add gost default || true
   elif is_openwrt; then
-    /etc/init.d/gost enable >/dev/null 2>&1 || true
+    echo "⚙️ 设置 gost 开机自启(OpenWrt)..."
+    /etc/init.d/gost enable || true
   fi
 }
 
@@ -541,6 +699,10 @@ ADDR=${SERVER_ADDR:-}
 SECRET=${SECRET:-}
 # WebSocket 协议：ws 或 wss
 SCHEME=${SCHEME:-ws}
+# Agent 自动升级：1 开启，0 关闭
+AGENT_AUTO_UPGRADE=${AGENT_AUTO_UPGRADE:-1}
+# GOST Web API 本地端口（Agent 将固定绑定 127.0.0.1）
+GOST_API_PORT=${GOST_API_PORT:-18080}
 EOF
 
   if is_openwrt && ! is_systemd; then
@@ -567,7 +729,7 @@ start_service() {
   procd_open_instance
   procd_set_param command "\$AGENT_BIN"
   procd_set_param respawn 5 5 0
-  procd_set_param env ADDR="\$ADDR" SECRET="\$SECRET" SCHEME="\$SCHEME"
+  procd_set_param env ADDR="\$ADDR" SECRET="\$SECRET" SCHEME="\$SCHEME" AGENT_AUTO_UPGRADE="\${AGENT_AUTO_UPGRADE:-1}" GOST_API_PORT="\${GOST_API_PORT:-18080}"
   procd_set_param stdout 1
   procd_set_param stderr 1
   procd_close_instance
@@ -605,7 +767,8 @@ respawn_max=0
 retry="SIGTERM/5 SIGKILL/5"
 
 [ -f /etc/default/flux-agent ] && . /etc/default/flux-agent
-export ADDR SECRET SCHEME
+export ADDR SECRET SCHEME GOST_API_PORT
+export AGENT_AUTO_UPGRADE
 
 depend() {
   need net
@@ -659,34 +822,40 @@ done
 
 # 设置代理前缀（用于 GitHub 下载加速）
 if [[ "$PROXY_MODE" == "4" ]]; then
-  PROXY_PREFIX="https://proxy.529851.xyz/"
+  PROXY_PREFIX="https://proxy.199028.xyz/"
 elif [[ "$PROXY_MODE" == "6" ]]; then
   PROXY_PREFIX="http://[240b:4000:93:de01:ffff:c725:3c65:47ff]:5000/"
+fi
+# 带 -p 时，强制 GitHub 相关下载只走代理，不做直连回退
+if [[ -n "$PROXY_MODE" ]]; then
+  if [[ -z "$PROXY_PREFIX" ]]; then
+    echo "❌ 无效 -p 参数: $PROXY_MODE (仅支持 4 或 6)"
+    exit 1
+  fi
+  FORCE_PROXY_GITHUB=1
 fi
 init_source_mode
 
 get_latest_gost_version() {
-  local api url tag
-  local api_list=()
-  if [[ "$SOURCE_MODE" == "cn" || "$SOURCE_MODE" == "static" ]]; then
-    [[ -n "$PROXY_PREFIX" ]] && api_list+=("${PROXY_PREFIX}${BASE_GOST_REPO_API}")
-    api_list+=("$BASE_GOST_REPO_API")
-  else
-    api_list+=("$BASE_GOST_REPO_API")
-    [[ -n "$PROXY_PREFIX" ]] && api_list+=("${PROXY_PREFIX}${BASE_GOST_REPO_API}")
-  fi
-  for api in "${api_list[@]}"; do
+  local api tag
+  echo "🔎 获取最新 GOST 版本..." >&2
+  while read -r api; do
+    [[ -z "$api" ]] && continue
+    echo "  - 查询: $api" >&2
     if has_jq; then
-      tag=$(curl -fsSL "$api" | jq -r '.tag_name' 2>/dev/null | head -n1 || true)
+      tag=$(curl_text "$api" | jq -r '.tag_name' 2>/dev/null | head -n1 || true)
     else
-      tag=$(curl -fsSL "$api" 2>/dev/null | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' | head -n1 || true)
+      tag=$(curl_text "$api" 2>/dev/null | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' | head -n1 || true)
     fi
     tag=$(echo "$tag" | tr -d '\r\n ')
     if [[ -n "$tag" ]]; then
+      echo "✅ 最新 GOST 版本: $tag" >&2
       echo "$tag"
       return 0
     fi
-  done
+    echo "  - 查询失败或无 tag，尝试下一个源" >&2
+  done < <(expand_github_urls "$BASE_GOST_REPO_API")
+  echo "⚠️ 获取最新版本失败，使用保底版本 v3.2.6" >&2
   echo "v3.2.6"
   return 0
 }
@@ -714,9 +883,10 @@ resolve_latest_gost_url() {
   local ver ver_no_v
   ver=$(get_latest_gost_version)
   ver_no_v="${ver#v}"
+  echo "🔎 匹配 GOST Linux/${token} 下载包..." >&2
   # 1) 静态镜像（按模式决定是否优先）
   local static_base="${STATIC_BASE}/gost"
-  local name url
+  local name url ok_url
   if (( prefer_static )); then
     for name in \
       "gost_${ver_no_v}_linux_${token}.tar.gz" \
@@ -729,22 +899,13 @@ resolve_latest_gost_url() {
       "gost-linux-${token}.zip"
     do
       url="${static_base}/${name}"
-      if curl -fsI "$url" >/dev/null 2>&1; then
-        echo "$url"; return 0
+      echo "  - 探测静态镜像: $url" >&2
+      if ok_url=$(pick_reachable_url "$url"); then
+        echo "$ok_url"; return 0
       fi
     done
   fi
-  # 2) GitHub API（优先顺序按模式选择直连/代理）
-  local api_list=()
-  if [[ "$SOURCE_MODE" == "cn" || "$SOURCE_MODE" == "static" ]]; then
-    [[ -n "$PROXY_PREFIX" ]] && api_list+=("${PROXY_PREFIX}${BASE_GOST_REPO_API}")
-    api_list+=("$BASE_GOST_REPO_API")
-  else
-    api_list+=("$BASE_GOST_REPO_API")
-    [[ -n "$PROXY_PREFIX" ]] && api_list+=("${PROXY_PREFIX}${BASE_GOST_REPO_API}")
-  fi
-  local prefer_proxy_dl=0
-  if [[ "$SOURCE_MODE" == "cn" || "$SOURCE_MODE" == "static" ]]; then prefer_proxy_dl=1; fi
+  # 2) GitHub API（自动支持 -p 代理）
 
   # 无论是否有 jq，都优先尝试版本号固定文件名
   for name in \
@@ -754,32 +915,30 @@ resolve_latest_gost_url() {
     "gost_${ver_no_v}_linux_${token}.zip"
   do
     url="https://github.com/go-gost/gost/releases/download/${ver}/${name}"
-    if (( prefer_proxy_dl )) && [[ -n "$PROXY_PREFIX" ]]; then
-      url="${PROXY_PREFIX}${url}"
-    fi
-    if curl -fsI "$url" >/dev/null 2>&1; then
-      echo "$url"; return 0
+    echo "  - 探测 GitHub 固定文件名: $url" >&2
+    if ok_url=$(pick_reachable_url "$url"); then
+      echo "$ok_url"; return 0
     fi
   done
 
   local api urls cand
-  for api in "${api_list[@]}"; do
+  while read -r api; do
+    [[ -z "$api" ]] && continue
     if ! has_jq; then
       continue
     fi
-    urls=$(curl -fsSL "$api" | jq -r '.assets[].browser_download_url' 2>/dev/null || true)
+    echo "  - 读取 release assets: $api" >&2
+    urls=$(curl_text "$api" | jq -r '.assets[].browser_download_url' 2>/dev/null || true)
     if [[ -z "$urls" ]]; then continue; fi
     for cand in $urls; do
       if [[ "$cand" == *linux* && "$cand" == *$token* && ( "$cand" == *.tar.gz || "$cand" == *.tgz || "$cand" == *.gz || "$cand" == *.zip ) ]]; then
-        if (( prefer_proxy_dl )) && [[ -n "$PROXY_PREFIX" ]] && [[ "$cand" == https://github.com/* ]]; then
-          echo "${PROXY_PREFIX}${cand}"
-        else
-          echo "$cand"
+        if ok_url=$(pick_reachable_url "$cand"); then
+          echo "$ok_url"
+          return 0
         fi
-        return 0
       fi
     done
-  done
+  done < <(expand_github_urls "$BASE_GOST_REPO_API")
   # 3) 如果 GitHub 失败且未尝试静态源，再尝试静态源
   if (( ! prefer_static )); then
     for name in \
@@ -793,8 +952,9 @@ resolve_latest_gost_url() {
       "gost-linux-${token}.zip"
     do
       url="${static_base}/${name}"
-      if curl -fsI "$url" >/dev/null 2>&1; then
-        echo "$url"; return 0
+      echo "  - 探测静态镜像: $url" >&2
+      if ok_url=$(pick_reachable_url "$url"); then
+        echo "$ok_url"; return 0
       fi
     done
   fi
@@ -806,12 +966,14 @@ download_and_install_gost() {
   local url="$1"
   local tmpdir; tmpdir=$(safe_mktemp_dir)
   echo "⬇️ 下载: $url"
-  if ! curl -fSL --retry 3 --retry-delay 1 "$url" -o "$tmpdir/pkg"; then
+  if ! download_from_urls "$tmpdir/pkg" "$url"; then
     echo "❌ 下载失败: $url"; rm -rf "$tmpdir"; return 1
   fi
   mkdir -p "$INSTALL_DIR"
   if [[ "$url" =~ \.tar\.gz$|\.tgz$ ]]; then
-    tar -xzf "$tmpdir/pkg" -C "$tmpdir"
+    if ! tar -xzf "$tmpdir/pkg" -C "$tmpdir"; then
+      echo "❌ 解压 tar.gz 失败"; rm -rf "$tmpdir"; return 1
+    fi
     local bin
     bin=$(find "$tmpdir" -type f -name gost -perm -111 | head -n1 || true)
     if [[ -z "$bin" ]]; then bin=$(find "$tmpdir" -type f -name gost | head -n1 || true); fi
@@ -819,7 +981,9 @@ download_and_install_gost() {
     install_bin "$bin" "$INSTALL_DIR/gost"
   elif [[ "$url" =~ \.zip$ ]]; then
     if command -v unzip >/dev/null 2>&1; then
-      unzip -o "$tmpdir/pkg" -d "$tmpdir" >/dev/null
+      if ! unzip -o "$tmpdir/pkg" -d "$tmpdir" >/dev/null; then
+        echo "❌ 解压 zip 失败"; rm -rf "$tmpdir"; return 1
+      fi
       local bin
       bin=$(find "$tmpdir" -type f -name gost -perm -111 | head -n1 || true)
       if [[ -z "$bin" ]]; then bin=$(find "$tmpdir" -type f -name gost | head -n1 || true); fi
@@ -829,7 +993,9 @@ download_and_install_gost() {
       echo "⚠️ 未安装 unzip，无法解压 .zip 包"; rm -rf "$tmpdir"; return 1
     fi
   elif [[ "$url" =~ \.gz$ ]]; then
-    gunzip -c "$tmpdir/pkg" > "$INSTALL_DIR/gost"
+    if ! gunzip -c "$tmpdir/pkg" > "$INSTALL_DIR/gost"; then
+      echo "❌ 解压 gz 失败"; rm -rf "$tmpdir"; return 1
+    fi
     chmod +x "$INSTALL_DIR/gost"
   else
     install_bin "$tmpdir/pkg" "$INSTALL_DIR/gost"
@@ -917,10 +1083,16 @@ install_gost() {
     if ! GOST_URL=$(resolve_latest_gost_url); then
       echo "❌ 无法解析最新 GOST 下载地址"; exit 1
     fi
-    download_and_install_gost "$GOST_URL"
+    if ! download_and_install_gost "$GOST_URL"; then
+      echo "❌ GOST 下载或安装失败"; exit 1
+    fi
   fi
 
   # 打印版本
+  if [[ ! -x "$INSTALL_DIR/gost" ]]; then
+    echo "❌ GOST 二进制不存在或不可执行: $INSTALL_DIR/gost"
+    exit 1
+  fi
   echo "🔎 gost 版本：$($INSTALL_DIR/gost -V)"
 
   # 写入 config.json (安装时总是创建新的)
@@ -1096,7 +1268,10 @@ update_gost() {
     echo "⬇️ 解析最新 GOST 下载地址..."
     local GOST_URL
     if ! GOST_URL=$(resolve_latest_gost_url); then echo "❌ 无法解析最新 GOST 下载地址"; return 1; fi
-    download_and_install_gost "$GOST_URL" || return 1
+    if ! download_and_install_gost "$GOST_URL"; then
+      echo "❌ GOST 下载或安装失败"
+      return 1
+    fi
     echo "🔎 新版本：$($INSTALL_DIR/gost -V || true)"
     echo "🔄 重启服务..."; start_gost_service
     if is_systemd; then systemctl daemon-reload; fi

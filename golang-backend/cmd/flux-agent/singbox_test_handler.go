@@ -1,10 +1,24 @@
 package main
 
 import (
+	"anytls/proxy/padding"
+	"anytls/proxy/session"
+	"anytls/util"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter/endpoint"
 	"github.com/sagernet/sing-box/adapter/inbound"
@@ -26,13 +40,6 @@ import (
 	protocolWireguard "github.com/sagernet/sing-box/protocol/wireguard"
 	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/service"
-	"io"
-	"log"
-	"net"
-	"net/http"
-	"strings"
-	"sync"
-	"time"
 )
 
 type singboxTestReq struct {
@@ -41,6 +48,7 @@ type singboxTestReq struct {
 	URL       string                 `json:"url"`
 	Duration  int                    `json:"duration"`
 	Outbound  map[string]interface{} `json:"outbound"`
+	EgressIP  string                 `json:"egressIp,omitempty"`
 }
 
 func runSingboxTest(req singboxTestReq) map[string]any {
@@ -56,6 +64,11 @@ func runSingboxTest(req singboxTestReq) map[string]any {
 	}
 	logOutboundSummary(outbound)
 	result["outbound"] = outboundSummary(outbound)
+	egressIP := strings.TrimSpace(req.EgressIP)
+	if typ, _ := outbound["type"].(string); strings.EqualFold(strings.TrimSpace(typ), "anytls") && egressIP != "" {
+		log.Printf("{\"event\":\"singbox_test_stage\",\"stage\":\"anytls_egress_mode\",\"egressIp\":%q}", egressIP)
+		return runAnyTLSEgressTest(req, outbound, egressIP)
+	}
 	outbound["tag"] = "proxy"
 
 	cfg := map[string]interface{}{
@@ -121,7 +134,7 @@ func runSingboxTest(req singboxTestReq) map[string]any {
 	}
 	client := &http.Client{
 		Transport: transport,
-		Timeout:   12 * time.Second,
+		Timeout:   40 * time.Second,
 	}
 	log.Printf("{\"event\":\"singbox_test_stage\",\"stage\":\"http_client_ready\"}")
 
@@ -136,7 +149,7 @@ func runSingboxTest(req singboxTestReq) map[string]any {
 		if dur <= 0 {
 			dur = 3
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(dur+8)*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(dur+35)*time.Second)
 		defer cancel()
 		reqHTTP, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
 		reqHTTP.Header.Set("Accept-Encoding", "identity")
@@ -145,7 +158,7 @@ func runSingboxTest(req singboxTestReq) map[string]any {
 		resp, err := client.Do(reqHTTP)
 		if err != nil {
 			result["message"] = err.Error()
-			result["hint"] = classifySingboxError(err, outbound)
+			result["hint"] = classifyAnyTLSEgressError(err, outbound, egressIP)
 			return result
 		}
 		log.Printf("{\"event\":\"singbox_test_stage\",\"stage\":\"http_response_ready\",\"status\":%d}", resp.StatusCode)
@@ -165,7 +178,7 @@ func runSingboxTest(req singboxTestReq) map[string]any {
 					break
 				}
 				result["message"] = err.Error()
-				result["hint"] = classifySingboxError(err, outbound)
+				result["hint"] = classifyAnyTLSEgressError(err, outbound, egressIP)
 				return result
 			}
 		}
@@ -184,10 +197,228 @@ func runSingboxTest(req singboxTestReq) map[string]any {
 		lat := time.Since(start).Milliseconds()
 		if err != nil {
 			result["message"] = err.Error()
-			result["hint"] = classifySingboxError(err, outbound)
+			result["hint"] = classifyAnyTLSEgressError(err, outbound, egressIP)
 			return result
 		}
 		log.Printf("{\"event\":\"singbox_test_stage\",\"stage\":\"http_response_ready\",\"status\":%d}", resp.StatusCode)
+		_, _ = io.CopyN(io.Discard, resp.Body, 4096)
+		resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			result["message"] = fmt.Sprintf("http status %d", resp.StatusCode)
+			result["hint"] = "目标返回非 2xx"
+			result["latencyMs"] = float64(lat)
+			return result
+		}
+		result["success"] = true
+		result["latencyMs"] = float64(lat)
+		return result
+	}
+}
+
+type anyTLSSessionConn struct {
+	net.Conn
+	closeFn  func() error
+	closeMux sync.Once
+}
+
+func (c *anyTLSSessionConn) Close() error {
+	var err error
+	c.closeMux.Do(func() {
+		if c.Conn != nil {
+			err = c.Conn.Close()
+		}
+		if c.closeFn != nil {
+			if cerr := c.closeFn(); err == nil {
+				err = cerr
+			}
+		}
+	})
+	return err
+}
+
+func parseAnyTLSOutbound(outbound map[string]interface{}) (server string, port int, password string, sni string, err error) {
+	server, _ = outbound["server"].(string)
+	password, _ = outbound["password"].(string)
+	if server == "" {
+		err = fmt.Errorf("missing anytls server")
+		return
+	}
+	v, ok := outbound["server_port"]
+	if !ok {
+		v = outbound["port"]
+	}
+	switch p := v.(type) {
+	case float64:
+		port = int(p)
+	case int:
+		port = p
+	case int64:
+		port = int(p)
+	case string:
+		port, _ = strconv.Atoi(strings.TrimSpace(p))
+	}
+	if port <= 0 || port > 65535 {
+		err = fmt.Errorf("missing anytls port")
+		return
+	}
+	if password == "" {
+		err = fmt.Errorf("missing anytls password")
+		return
+	}
+	sni, _ = outbound["sni"].(string)
+	if sni == "" {
+		if tlsCfg, ok := outbound["tls"].(map[string]interface{}); ok {
+			if v, ok2 := tlsCfg["server_name"].(string); ok2 {
+				sni = strings.TrimSpace(v)
+			}
+		}
+	}
+	if sni == "" && net.ParseIP(server) == nil {
+		sni = server
+	}
+	return
+}
+
+func dialAnyTLSStream(ctx context.Context, outbound map[string]interface{}, network string, addr string, egressIP string) (net.Conn, error) {
+	_ = network
+	server, port, password, sni, err := parseAnyTLSOutbound(outbound)
+	if err != nil {
+		return nil, err
+	}
+
+	dialer := &net.Dialer{}
+	raw, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(server, strconv.Itoa(port)))
+	if err != nil {
+		return nil, err
+	}
+	tlsCfg := &tls.Config{
+		InsecureSkipVerify: true,
+	}
+	if sni != "" {
+		tlsCfg.ServerName = sni
+	}
+	tlsConn := tls.Client(raw, tlsCfg)
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		_ = raw.Close()
+		return nil, err
+	}
+
+	sum := sha256.Sum256([]byte(password))
+	preface := make([]byte, 34)
+	copy(preface[:32], sum[:])
+	binary.BigEndian.PutUint16(preface[32:], 0)
+	if _, err := tlsConn.Write(preface); err != nil {
+		_ = tlsConn.Close()
+		return nil, err
+	}
+
+	settings := util.StringMap{}
+	if strings.TrimSpace(egressIP) != "" {
+		settings["egress-ip"] = strings.TrimSpace(egressIP)
+	}
+	sess := session.NewClientSession(tlsConn, &padding.DefaultPaddingFactory, settings)
+	sess.Run()
+
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		_ = sess.Close()
+		return nil, err
+	}
+	dest := M.ParseSocksaddrHostPortStr(host, portStr)
+	stream, err := sess.OpenStream()
+	if err != nil {
+		_ = sess.Close()
+		return nil, err
+	}
+	if err := M.SocksaddrSerializer.WriteAddrPort(stream, dest); err != nil {
+		_ = sess.Close()
+		return nil, err
+	}
+	return &anyTLSSessionConn{Conn: stream, closeFn: sess.Close}, nil
+}
+
+func runAnyTLSEgressTest(req singboxTestReq, outbound map[string]interface{}, egressIP string) map[string]any {
+	result := map[string]any{
+		"success":  false,
+		"mode":     req.Mode,
+		"outbound": outboundSummary(outbound),
+		"egressIp": egressIP,
+	}
+	transport := &http.Transport{
+		DisableCompression: true,
+		TLSClientConfig:    &tls.Config{},
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dialAnyTLSStream(ctx, outbound, network, addr, egressIP)
+		},
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   40 * time.Second,
+	}
+	log.Printf("{\"event\":\"singbox_test_stage\",\"stage\":\"anytls_http_client_ready\"}")
+
+	url := strings.TrimSpace(req.URL)
+	if url == "" {
+		url = "http://www.google.com/generate_204"
+	}
+	switch strings.ToLower(req.Mode) {
+	case "speed":
+		dur := req.Duration
+		if dur <= 0 {
+			dur = 3
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(dur+35)*time.Second)
+		defer cancel()
+		reqHTTP, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+		reqHTTP.Header.Set("Accept-Encoding", "identity")
+		log.Printf("{\"event\":\"singbox_test_stage\",\"stage\":\"anytls_http_request_start\"}")
+		start := time.Now()
+		resp, err := client.Do(reqHTTP)
+		if err != nil {
+			result["message"] = err.Error()
+			result["hint"] = classifyAnyTLSEgressError(err, outbound, egressIP)
+			return result
+		}
+		log.Printf("{\"event\":\"singbox_test_stage\",\"stage\":\"anytls_http_response_ready\",\"status\":%d}", resp.StatusCode)
+		defer resp.Body.Close()
+		buf := make([]byte, 32*1024)
+		var total int64
+		for {
+			if time.Since(start) >= time.Duration(dur)*time.Second {
+				break
+			}
+			n, err := resp.Body.Read(buf)
+			if n > 0 {
+				total += int64(n)
+			}
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				result["message"] = err.Error()
+				result["hint"] = classifyAnyTLSEgressError(err, outbound, egressIP)
+				return result
+			}
+		}
+		elapsed := time.Since(start)
+		if elapsed <= 0 {
+			elapsed = time.Duration(dur) * time.Second
+		}
+		mbps := float64(total*8) / (elapsed.Seconds() * 1e6)
+		result["success"] = true
+		result["speedMbps"] = mbps
+		return result
+	default:
+		log.Printf("{\"event\":\"singbox_test_stage\",\"stage\":\"anytls_http_request_start\"}")
+		start := time.Now()
+		resp, err := client.Get(url)
+		lat := time.Since(start).Milliseconds()
+		if err != nil {
+			result["message"] = err.Error()
+			result["hint"] = classifyAnyTLSEgressError(err, outbound, egressIP)
+			return result
+		}
+		log.Printf("{\"event\":\"singbox_test_stage\",\"stage\":\"anytls_http_response_ready\",\"status\":%d}", resp.StatusCode)
 		_, _ = io.CopyN(io.Discard, resp.Body, 4096)
 		resp.Body.Close()
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -293,6 +524,31 @@ func classifySingboxError(err error, outbound map[string]interface{}) string {
 		}
 	}
 	return "连接失败，请检查协议/参数/端口"
+}
+
+func classifyAnyTLSEgressError(err error, outbound map[string]interface{}, egressIP string) string {
+	base := classifySingboxError(err, outbound)
+	if err == nil {
+		return base
+	}
+	ip := strings.TrimSpace(egressIP)
+	if ip == "" {
+		return base
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "cannot assign requested address") || strings.Contains(msg, "address not available") || strings.Contains(msg, "not local") {
+		return fmt.Sprintf("egress-ip %s 未绑定在出口节点本机地址上", ip)
+	}
+	if strings.Contains(msg, "invalid egress-ip") {
+		return fmt.Sprintf("egress-ip %s 格式无效", ip)
+	}
+	if strings.Contains(msg, "i/o timeout") || strings.Contains(msg, "context deadline exceeded") || strings.Contains(msg, "no route to host") || strings.Contains(msg, "network is unreachable") {
+		return fmt.Sprintf("egress-ip %s 到目标网络不通或被拦截", ip)
+	}
+	if base != "" {
+		return base
+	}
+	return fmt.Sprintf("egress-ip %s 代理连接失败", ip)
 }
 
 var (

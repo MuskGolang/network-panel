@@ -13,8 +13,20 @@ type VirtualGridProps<T> = {
   className?: string;
 };
 
-function pickScrollElement(): HTMLElement | null {
+function pickScrollElement(from?: HTMLElement | null): HTMLElement | null {
   if (typeof document === "undefined") return null;
+  let cur = from?.parentElement || null;
+  while (cur && cur !== document.body) {
+    const style = window.getComputedStyle(cur);
+    const overflowY = style.overflowY;
+    if (
+      (overflowY === "auto" || overflowY === "scroll") &&
+      cur.scrollHeight > cur.clientHeight
+    ) {
+      return cur;
+    }
+    cur = cur.parentElement;
+  }
   const main = document.querySelector("main");
   if (main) {
     const style = window.getComputedStyle(main);
@@ -46,6 +58,7 @@ export default function VirtualGrid<T>({
 
   useEffect(() => {
     if (!containerRef.current) return;
+    setScrollEl(pickScrollElement(containerRef.current));
     const ro = new ResizeObserver((entries) => {
       const entry = entries[0];
       if (entry) setContainerWidth(entry.contentRect.width);
@@ -100,6 +113,22 @@ export default function VirtualGrid<T>({
   }, [columns, items.length, scrollEl, containerWidth, rowVirtualizer]);
 
   const virtualRows = rowVirtualizer.getVirtualItems();
+
+  if (containerWidth > 0 && containerWidth < 640) {
+    return (
+      <div ref={containerRef} className={className}>
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))`,
+            gap: `${gap}px`,
+          }}
+        >
+          {items.map((item, index) => renderItem(item, index))}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div ref={containerRef} className={className}>

@@ -201,6 +201,7 @@ func pruneOldData() {
 	}
 	for {
 		clean(&model.NodeOpLog{}, "time_ms")
+		clean(&model.NodeAnyTLSCertLog{}, "time_ms")
 		clean(&model.NodeProbeResult{}, "time_ms")
 		clean(&model.NodeSysInfo{}, "time_ms")
 		clean(&model.FlowTimeseries{}, "time_ms")

@@ -10,10 +10,12 @@ services:
       DB_PASSWORD: 123456
       JWT_SECRET: network-panel-secret-yjkj02
       LOG_DIR: /app/logs
+      ANYTLS_CERT_DIR: /app/data/anytls
     ports:
       - "6365:6365"
     volumes:
       - ./backend_logs:/app/logs
+      - ./backend_data:/app/data
     healthcheck:
       test: ["CMD", "sh", "-c", "wget --no-verbose --tries=1 --spider http://localhost:6365/flow/test || exit 1"]
       interval: 30s

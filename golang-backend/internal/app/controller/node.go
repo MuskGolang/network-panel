@@ -8,18 +8,53 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"network-panel/golang-backend/internal/app/dto"
 	"network-panel/golang-backend/internal/app/model"
 	"network-panel/golang-backend/internal/app/response"
+	appver "network-panel/golang-backend/internal/app/version"
 	dbpkg "network-panel/golang-backend/internal/db"
 )
 
 // NodeSelfCheckRequest for quick node self-check.
 type NodeSelfCheckRequest struct {
 	NodeID int64 `json:"nodeId"`
+}
+
+func parseNodeOpLogStdoutJSON(raw *string) map[string]any {
+	if raw == nil {
+		return nil
+	}
+	s := strings.TrimSpace(*raw)
+	if s == "" {
+		return nil
+	}
+	var out map[string]any
+	if json.Unmarshal([]byte(s), &out) != nil {
+		return nil
+	}
+	return out
+}
+
+func parseJSONBool(v any) (bool, bool) {
+	switch x := v.(type) {
+	case bool:
+		return x, true
+	case float64:
+		return x != 0, true
+	case string:
+		s := strings.ToLower(strings.TrimSpace(x))
+		if s == "true" || s == "1" || s == "yes" || s == "on" {
+			return true, true
+		}
+		if s == "false" || s == "0" || s == "no" || s == "off" {
+			return false, true
+		}
+	}
+	return false, false
 }
 
 // NodeCreate 创建节点
@@ -131,13 +166,14 @@ func NodeList(c *gin.Context) {
 					}
 					var tunnels []model.Tunnel
 					_ = dbpkg.DB.Where("id in ?", ids).Find(&tunnels).Error
+					pathMap := getTunnelPathNodesMap(ids)
 					needIDs := map[int64]bool{}
 					for _, t := range tunnels {
 						needIDs[t.InNodeID] = true
 						if t.OutNodeID != nil {
 							needIDs[*t.OutNodeID] = true
 						}
-						for _, pid := range getTunnelPathNodes(t.ID) {
+						for _, pid := range pathMap[t.ID] {
 							needIDs[pid] = true
 						}
 					}
@@ -176,11 +212,218 @@ func NodeList(c *gin.Context) {
 		idList = append(idList, n.ID)
 	}
 	runtimeMap := map[int64]model.NodeRuntime{}
+	anyTLSMap := map[int64]model.AnyTLSSetting{}
+	anyTLSPortMap := map[int64][]anyTLSPortMapping{}
+	type anyTLSRuntimeAgg struct {
+		Starts           int    `json:"starts"`
+		AcceptErr        int    `json:"acceptErr"`
+		ConnReject       int    `json:"connReject"`
+		HandshakeTimeout int    `json:"handshakeTimeout"`
+		TLSClientHello   int    `json:"tlsClientHello"`
+		TLSHandshakeErr  int    `json:"tlsHandshakeErr"`
+		TLSConnReset     int    `json:"tlsConnResetByPeer"`
+		TLSSNIMismatch   int    `json:"tlsSniMismatch"`
+		ListenErr        int    `json:"listenErr"`
+		StreamErr        int    `json:"streamErr"`
+		AuthFail         int    `json:"authFail"`
+		ReadErr          int    `json:"readErr"`
+		OutboundErr      int    `json:"outboundErr"`
+		EgressDialErr    int    `json:"egressDialErr"`
+		RecentCount      int    `json:"recentCount"`
+		LastLogMs        int64  `json:"lastLogMs"`
+		State            string `json:"state"`
+	}
+	type gostAPIBindAgg struct {
+		LoopbackOnly *bool  `json:"loopbackOnly,omitempty"`
+		Detail       string `json:"detail,omitempty"`
+		CheckedAtMs  int64  `json:"checkedAtMs,omitempty"`
+	}
+	anyTLSRuntimeMap := map[int64]anyTLSRuntimeAgg{}
+	gostAPIBindMap := map[int64]gostAPIBindAgg{}
+	anyTLSRuntimeWindowSec := 900
 	if len(idList) > 0 {
 		var runs []model.NodeRuntime
 		_ = dbpkg.DB.Where("node_id in ?", idList).Find(&runs).Error
 		for _, r := range runs {
 			runtimeMap[r.NodeID] = r
+		}
+		var ats []model.AnyTLSSetting
+		_ = dbpkg.DB.Where("node_id in ?", idList).Find(&ats).Error
+		for _, st := range ats {
+			anyTLSMap[st.NodeID] = st
+		}
+		var atPorts []model.AnyTLSPortEgress
+		_ = dbpkg.DB.Where("node_id in ?", idList).Order("node_id asc, port asc").Find(&atPorts).Error
+		for _, row := range atPorts {
+			exitIP := ""
+			if row.EgressIP != nil {
+				exitIP = strings.TrimSpace(*row.EgressIP)
+			}
+			anyTLSPortMap[row.NodeID] = append(anyTLSPortMap[row.NodeID], anyTLSPortMapping{
+				Port:   row.Port,
+				ExitIP: exitIP,
+			})
+		}
+		anyTLSNodeIDs := make([]int64, 0, len(anyTLSMap))
+		for nid, st := range anyTLSMap {
+			if st.ID > 0 && st.Port > 0 {
+				anyTLSNodeIDs = append(anyTLSNodeIDs, nid)
+			}
+		}
+		if len(anyTLSNodeIDs) > 0 {
+			windowFrom := time.Now().UnixMilli() - int64(anyTLSRuntimeWindowSec)*1000
+			type row struct {
+				NodeID    int64
+				Cmd       string
+				Cnt       int
+				MaxTimeMs int64
+			}
+			var rows []row
+			_ = dbpkg.DB.Model(&model.NodeOpLog{}).
+				Select("node_id, cmd, count(*) as cnt, max(time_ms) as max_time_ms").
+				Where("node_id in ? AND cmd LIKE ? AND time_ms >= ?", anyTLSNodeIDs, "OpLog:anytls_%", windowFrom).
+				Group("node_id, cmd").
+				Find(&rows).Error
+			for _, r := range rows {
+				agg := anyTLSRuntimeMap[r.NodeID]
+				agg.RecentCount += r.Cnt
+				if r.MaxTimeMs > agg.LastLogMs {
+					agg.LastLogMs = r.MaxTimeMs
+				}
+				cmd := strings.TrimPrefix(strings.TrimSpace(r.Cmd), "OpLog:")
+				switch cmd {
+				case "anytls_start":
+					agg.Starts += r.Cnt
+				case "anytls_accept_err":
+					agg.AcceptErr += r.Cnt
+				case "anytls_conn_reject":
+					agg.ConnReject += r.Cnt
+				case "anytls_handshake_timeout":
+					agg.HandshakeTimeout += r.Cnt
+				case "anytls_tls_client_hello":
+					agg.TLSClientHello += r.Cnt
+				case "anytls_tls_handshake_err":
+					agg.TLSHandshakeErr += r.Cnt
+				case "anytls_listen_err":
+					agg.ListenErr += r.Cnt
+				case "anytls_stream_err":
+					agg.StreamErr += r.Cnt
+				case "anytls_auth_fail":
+					agg.AuthFail += r.Cnt
+				case "anytls_read_err":
+					agg.ReadErr += r.Cnt
+				case "anytls_outbound_err":
+					agg.OutboundErr += r.Cnt
+				case "anytls_egress_dial_err":
+					agg.EgressDialErr += r.Cnt
+				}
+				anyTLSRuntimeMap[r.NodeID] = agg
+			}
+			for nid, agg := range anyTLSRuntimeMap {
+				if agg.RecentCount == 0 {
+					agg.State = "unknown"
+				} else if agg.AcceptErr > 0 || agg.ConnReject > 0 || agg.HandshakeTimeout > 0 || agg.TLSHandshakeErr > 0 || agg.ListenErr > 0 || agg.StreamErr > 0 || agg.AuthFail > 0 || agg.ReadErr > 0 || agg.OutboundErr > 0 || agg.EgressDialErr > 0 {
+					agg.State = "degraded"
+				} else {
+					agg.State = "healthy"
+				}
+				anyTLSRuntimeMap[nid] = agg
+			}
+
+			var tlsLogs []model.NodeOpLog
+			_ = dbpkg.DB.Select("node_id, cmd, stdout, time_ms").
+				Where("node_id in ? AND cmd in ? AND time_ms >= ?", anyTLSNodeIDs, []string{"OpLog:anytls_tls_client_hello", "OpLog:anytls_tls_handshake_err"}, windowFrom).
+				Find(&tlsLogs).Error
+			for _, lg := range tlsLogs {
+				agg := anyTLSRuntimeMap[lg.NodeID]
+				data := parseNodeOpLogStdoutJSON(lg.Stdout)
+				if data == nil {
+					anyTLSRuntimeMap[lg.NodeID] = agg
+					continue
+				}
+				cmd := strings.TrimPrefix(strings.TrimSpace(lg.Cmd), "OpLog:")
+				switch cmd {
+				case "anytls_tls_client_hello":
+					if v, ok := parseJSONBool(data["sniMismatch"]); ok && v {
+						agg.TLSSNIMismatch++
+					}
+				case "anytls_tls_handshake_err":
+					kind, _ := data["kind"].(string)
+					if strings.EqualFold(strings.TrimSpace(kind), "conn_reset_by_peer") {
+						agg.TLSConnReset++
+					}
+				}
+				anyTLSRuntimeMap[lg.NodeID] = agg
+			}
+		}
+		var bindLogs []model.NodeOpLog
+		_ = dbpkg.DB.Select("node_id, time_ms, message, stdout").
+			Where("node_id in ? AND cmd = ? AND message in ?", idList, "OpLog:gost_api", []string{"bind verify", "bind verify retry"}).
+			Order("time_ms desc").
+			Find(&bindLogs).Error
+		for _, lg := range bindLogs {
+			if _, exists := gostAPIBindMap[lg.NodeID]; exists {
+				continue
+			}
+			agg := gostAPIBindAgg{
+				CheckedAtMs: lg.TimeMs,
+				Detail:      strings.TrimSpace(lg.Message),
+			}
+			if lg.Stdout != nil {
+				raw := strings.TrimSpace(*lg.Stdout)
+				if raw != "" {
+					var data map[string]any
+					if json.Unmarshal([]byte(raw), &data) == nil {
+						if v, ok := data["loopbackOnly"]; ok {
+							switch x := v.(type) {
+							case bool:
+								b := x
+								agg.LoopbackOnly = &b
+							case float64:
+								b := x != 0
+								agg.LoopbackOnly = &b
+							case string:
+								s := strings.ToLower(strings.TrimSpace(x))
+								if s == "true" || s == "1" {
+									b := true
+									agg.LoopbackOnly = &b
+								} else if s == "false" || s == "0" {
+									b := false
+									agg.LoopbackOnly = &b
+								}
+							}
+						}
+						if d, _ := data["detail"].(string); strings.TrimSpace(d) != "" {
+							agg.Detail = strings.TrimSpace(d)
+						}
+					}
+				}
+			}
+			gostAPIBindMap[lg.NodeID] = agg
+		}
+		missIDs := make([]int64, 0, len(idList))
+		for _, nid := range idList {
+			if _, ok := gostAPIBindMap[nid]; !ok {
+				missIDs = append(missIDs, nid)
+			}
+		}
+		if len(missIDs) > 0 {
+			var bindErrLogs []model.NodeOpLog
+			_ = dbpkg.DB.Select("node_id, time_ms, message").
+				Where("node_id in ? AND cmd = ? AND message = ?", missIDs, "OpLog:gost_api_err", "bind verify failed, try normalize services").
+				Order("time_ms desc").
+				Find(&bindErrLogs).Error
+			for _, lg := range bindErrLogs {
+				if _, exists := gostAPIBindMap[lg.NodeID]; exists {
+					continue
+				}
+				b := false
+				gostAPIBindMap[lg.NodeID] = gostAPIBindAgg{
+					LoopbackOnly: &b,
+					Detail:       strings.TrimSpace(lg.Message),
+					CheckedAtMs:  lg.TimeMs,
+				}
+			}
 		}
 	}
 
@@ -226,6 +469,61 @@ func NodeList(c *gin.Context) {
 					m["usedPorts"] = list
 				}
 			}
+		}
+		if s, ok := gostAPIBindMap[n.ID]; ok {
+			m["gostApiBindCheckedAtMs"] = s.CheckedAtMs
+			m["gostApiBindDetail"] = s.Detail
+			if s.LoopbackOnly != nil {
+				m["gostApiBindLoopbackOnly"] = *s.LoopbackOnly
+			}
+		}
+		if at, ok := anyTLSMap[n.ID]; ok && at.ID > 0 {
+			m["anytlsPort"] = at.Port
+			if list := anyTLSPortMap[n.ID]; len(list) > 0 {
+				m["anytlsPorts"] = list
+			}
+			if cert, err := anyTLSNodeCertStatus(n.ID, true); err == nil && cert != nil {
+				m["anytlsCert"] = cert
+			}
+			if rt, ok := anyTLSRuntimeMap[n.ID]; ok {
+				m["anytlsRuntime"] = map[string]any{
+					"state":              rt.State,
+					"windowSec":          anyTLSRuntimeWindowSec,
+					"recentCount":        rt.RecentCount,
+					"starts":             rt.Starts,
+					"acceptErr":          rt.AcceptErr,
+					"connReject":         rt.ConnReject,
+					"handshakeTimeout":   rt.HandshakeTimeout,
+					"tlsClientHello":     rt.TLSClientHello,
+					"tlsHandshakeErr":    rt.TLSHandshakeErr,
+					"tlsConnResetByPeer": rt.TLSConnReset,
+					"tlsSniMismatch":     rt.TLSSNIMismatch,
+					"listenErr":          rt.ListenErr,
+					"streamErr":          rt.StreamErr,
+					"authFail":           rt.AuthFail,
+					"readErr":            rt.ReadErr,
+					"outboundErr":        rt.OutboundErr,
+					"egressDialErr":      rt.EgressDialErr,
+					"lastLogMs":          rt.LastLogMs,
+				}
+			} else {
+				m["anytlsRuntime"] = map[string]any{
+					"state":              "unknown",
+					"windowSec":          anyTLSRuntimeWindowSec,
+					"recentCount":        0,
+					"tlsClientHello":     0,
+					"tlsHandshakeErr":    0,
+					"tlsConnResetByPeer": 0,
+					"tlsSniMismatch":     0,
+					"streamErr":          0,
+					"authFail":           0,
+					"readErr":            0,
+					"outboundErr":        0,
+				}
+			}
+		} else if list := anyTLSPortMap[n.ID]; len(list) > 0 {
+			m["anytlsPort"] = list[0].Port
+			m["anytlsPorts"] = list
 		}
 		// derive cycleMonths from stored cycleDays
 		if n.CycleDays != nil {
@@ -312,7 +610,6 @@ func NodeUpdate(c *gin.Context) {
 	}
 	// update tunnels referencing IPs
 	dbpkg.DB.Model(&model.Tunnel{}).Where("in_node_id = ?", n.ID).Update("in_ip", n.IP)
-	dbpkg.DB.Model(&model.Tunnel{}).Where("out_node_id = ?", n.ID).Update("out_ip", n.ServerIP)
 	c.JSON(http.StatusOK, response.OkMsg("节点更新成功"))
 }
 
@@ -561,6 +858,283 @@ func NodeOps(c *gin.Context) {
 	c.JSON(http.StatusOK, response.Ok(map[string]any{"ops": list}))
 }
 
+// NodeAnyTLSCertLogs 查询节点 AnyTLS 证书日志
+// POST /api/v1/node/anytls-cert-logs {nodeId, limit}
+func NodeAnyTLSCertLogs(c *gin.Context) {
+	var p struct {
+		NodeID int64 `json:"nodeId"`
+		Limit  int   `json:"limit"`
+	}
+	if err := c.ShouldBindJSON(&p); err != nil {
+		c.JSON(http.StatusOK, response.ErrMsg("参数错误"))
+		return
+	}
+	if p.NodeID <= 0 {
+		c.JSON(http.StatusOK, response.ErrMsg("参数错误"))
+		return
+	}
+	if p.Limit <= 0 || p.Limit > 1000 {
+		p.Limit = 200
+	}
+	_, _, _, _, _, errMsg, ok := nodeAccess(c, p.NodeID, false)
+	if !ok {
+		c.JSON(http.StatusOK, response.ErrMsg(errMsg))
+		return
+	}
+	var logs []model.NodeAnyTLSCertLog
+	dbpkg.DB.Where("node_id = ?", p.NodeID).Order("time_ms desc").Limit(p.Limit).Find(&logs)
+	c.JSON(http.StatusOK, response.Ok(map[string]any{"logs": logs}))
+}
+
+// NodeAnyTLSRuntimeLogs 查询节点 AnyTLS 运行日志与状态汇总
+// POST /api/v1/node/anytls-logs {nodeId, limit, windowSec}
+func NodeAnyTLSRuntimeLogs(c *gin.Context) {
+	var p struct {
+		NodeID    int64 `json:"nodeId"`
+		Limit     int   `json:"limit"`
+		WindowSec int   `json:"windowSec"`
+	}
+	if err := c.ShouldBindJSON(&p); err != nil {
+		c.JSON(http.StatusOK, response.ErrMsg("参数错误"))
+		return
+	}
+	if p.NodeID <= 0 {
+		c.JSON(http.StatusOK, response.ErrMsg("参数错误"))
+		return
+	}
+	if p.Limit <= 0 || p.Limit > 1000 {
+		p.Limit = 200
+	}
+	if p.WindowSec <= 0 || p.WindowSec > 86400 {
+		p.WindowSec = 900
+	}
+	_, _, _, _, _, errMsg, ok := nodeAccess(c, p.NodeID, false)
+	if !ok {
+		c.JSON(http.StatusOK, response.ErrMsg(errMsg))
+		return
+	}
+
+	var logs []model.NodeOpLog
+	dbpkg.DB.Where("node_id = ? AND cmd LIKE ?", p.NodeID, "OpLog:anytls_%").
+		Order("time_ms desc").
+		Limit(p.Limit).
+		Find(&logs)
+
+	nowMs := time.Now().UnixMilli()
+	windowFrom := nowMs - int64(p.WindowSec)*1000
+	recent := 0
+	starts := 0
+	acceptErr := 0
+	connReject := 0
+	handshakeTimeout := 0
+	tlsClientHello := 0
+	tlsHandshakeErr := 0
+	tlsConnResetByPeer := 0
+	tlsSniMismatch := 0
+	listenErr := 0
+	streamErr := 0
+	authFail := 0
+	readErr := 0
+	outboundErr := 0
+	egressDialErr := 0
+	var lastLogMs int64
+	var lastStartMs int64
+	for i, lg := range logs {
+		if i == 0 {
+			lastLogMs = lg.TimeMs
+		}
+		cmd := strings.TrimPrefix(strings.TrimSpace(lg.Cmd), "OpLog:")
+		if cmd == "anytls_start" && lastStartMs == 0 {
+			lastStartMs = lg.TimeMs
+		}
+		if lg.TimeMs < windowFrom {
+			continue
+		}
+		recent++
+		switch cmd {
+		case "anytls_start":
+			starts++
+		case "anytls_accept_err":
+			acceptErr++
+		case "anytls_conn_reject":
+			connReject++
+		case "anytls_handshake_timeout":
+			handshakeTimeout++
+		case "anytls_tls_client_hello":
+			tlsClientHello++
+		case "anytls_tls_handshake_err":
+			tlsHandshakeErr++
+		case "anytls_listen_err":
+			listenErr++
+		case "anytls_stream_err":
+			streamErr++
+		case "anytls_auth_fail":
+			authFail++
+		case "anytls_read_err":
+			readErr++
+		case "anytls_outbound_err":
+			outboundErr++
+		case "anytls_egress_dial_err":
+			egressDialErr++
+		}
+		if (cmd == "anytls_tls_client_hello" || cmd == "anytls_tls_handshake_err") && lg.Stdout != nil {
+			data := parseNodeOpLogStdoutJSON(lg.Stdout)
+			if data != nil {
+				if cmd == "anytls_tls_client_hello" {
+					if v, ok := parseJSONBool(data["sniMismatch"]); ok && v {
+						tlsSniMismatch++
+					}
+				} else if cmd == "anytls_tls_handshake_err" {
+					kind, _ := data["kind"].(string)
+					if strings.EqualFold(strings.TrimSpace(kind), "conn_reset_by_peer") {
+						tlsConnResetByPeer++
+					}
+				}
+			}
+		}
+	}
+
+	status := "unknown"
+	if len(logs) > 0 {
+		status = "healthy"
+		if acceptErr > 0 || connReject > 0 || handshakeTimeout > 0 || tlsHandshakeErr > 0 || listenErr > 0 || streamErr > 0 || authFail > 0 || readErr > 0 || outboundErr > 0 || egressDialErr > 0 {
+			status = "degraded"
+		}
+	}
+
+	c.JSON(http.StatusOK, response.Ok(map[string]any{
+		"logs": logs,
+		"status": map[string]any{
+			"state":              status,
+			"windowSec":          p.WindowSec,
+			"windowFromMs":       windowFrom,
+			"windowToMs":         nowMs,
+			"recentCount":        recent,
+			"totalLogs":          len(logs),
+			"starts":             starts,
+			"acceptErr":          acceptErr,
+			"connReject":         connReject,
+			"handshakeTimeout":   handshakeTimeout,
+			"tlsClientHello":     tlsClientHello,
+			"tlsHandshakeErr":    tlsHandshakeErr,
+			"tlsConnResetByPeer": tlsConnResetByPeer,
+			"tlsSniMismatch":     tlsSniMismatch,
+			"listenErr":          listenErr,
+			"streamErr":          streamErr,
+			"authFail":           authFail,
+			"readErr":            readErr,
+			"outboundErr":        outboundErr,
+			"egressDialErr":      egressDialErr,
+			"lastLogMs":          lastLogMs,
+			"lastStartMs":        lastStartMs,
+		},
+	}))
+}
+
+func expectedAgentVersionByCurrent(agentVersion string) string {
+	sv := appver.Get()
+	if strings.HasPrefix(sv, "server-") {
+		sv = strings.TrimPrefix(sv, "server-")
+	}
+	prefix := "go-agent-"
+	if strings.HasPrefix(strings.TrimSpace(agentVersion), "go-agent2-") {
+		prefix = "go-agent2-"
+	}
+	return prefix + sv
+}
+
+// NodeAgentUpgradeBatch 手动触发节点 agent 升级（支持全部）
+// POST /api/v1/node/agent-upgrade-batch {nodeIds?:[]}
+func NodeAgentUpgradeBatch(c *gin.Context) {
+	var p struct {
+		NodeIDs []int64 `json:"nodeIds"`
+	}
+	_ = c.ShouldBindJSON(&p)
+
+	var nodes []model.Node
+	if len(p.NodeIDs) > 0 {
+		ids := make([]int64, 0, len(p.NodeIDs))
+		seen := map[int64]struct{}{}
+		for _, id := range p.NodeIDs {
+			if id <= 0 {
+				continue
+			}
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			ids = append(ids, id)
+		}
+		if len(ids) == 0 {
+			c.JSON(http.StatusOK, response.ErrMsg("节点ID为空"))
+			return
+		}
+		if err := dbpkg.DB.Where("id in ?", ids).Find(&nodes).Error; err != nil {
+			c.JSON(http.StatusOK, response.ErrMsg("获取节点失败"))
+			return
+		}
+	} else {
+		if err := dbpkg.DB.Find(&nodes).Error; err != nil {
+			c.JSON(http.StatusOK, response.ErrMsg("获取节点失败"))
+			return
+		}
+	}
+	if len(nodes) == 0 {
+		c.JSON(http.StatusOK, response.Ok(map[string]any{
+			"total":   0,
+			"ok":      0,
+			"failed":  0,
+			"results": []map[string]any{},
+		}))
+		return
+	}
+
+	results := make([]map[string]any, 0, len(nodes))
+	okCnt := 0
+	failCnt := 0
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	wg.Add(len(nodes))
+	for _, n := range nodes {
+		node := n
+		go func() {
+			defer wg.Done()
+			to := expectedAgentVersionByCurrent(node.Version)
+			item := map[string]any{
+				"nodeId":   node.ID,
+				"nodeName": node.Name,
+				"to":       to,
+				"ok":       true,
+			}
+			if err := sendWSCommand(node.ID, "UpgradeAgent", map[string]any{"to": to}); err != nil {
+				item["ok"] = false
+				item["error"] = err.Error()
+			}
+			mu.Lock()
+			if ok, _ := item["ok"].(bool); ok {
+				okCnt++
+			} else {
+				failCnt++
+			}
+			results = append(results, item)
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	sort.Slice(results, func(i, j int) bool {
+		li, _ := results[i]["nodeId"].(int64)
+		lj, _ := results[j]["nodeId"].(int64)
+		return li < lj
+	})
+
+	c.JSON(http.StatusOK, response.Ok(map[string]any{
+		"total":   len(nodes),
+		"ok":      okCnt,
+		"failed":  failCnt,
+		"results": results,
+	}))
+}
+
 // NodeRestartGost 重启gost
 // @Summary 重启节点上的gost
 // @Tags node
@@ -617,17 +1191,22 @@ func NodeRestartGost(c *gin.Context) {
 // @Tags node
 // @Accept json
 // @Produce json
-// @Param data body SwaggerNodeSimpleReq true "节点ID"
+// @Param data body SwaggerNodeEnableGostAPIReq true "节点ID + 可选端口"
 // @Success 200 {object} BaseSwaggerResp
 // @Router /api/v1/node/enable-gost-api [post]
-// POST /api/v1/node/enable-gost-api {nodeId}
+// POST /api/v1/node/enable-gost-api {nodeId, port?}
 // Ask agent to enable top-level GOST Web API (write api{} then restart gost)
 func NodeEnableGostAPI(c *gin.Context) {
 	var p struct {
 		NodeID int64 `json:"nodeId" binding:"required"`
+		Port   int   `json:"port"`
 	}
 	if err := c.ShouldBindJSON(&p); err != nil {
 		c.JSON(http.StatusOK, response.ErrMsg("参数错误"))
+		return
+	}
+	if p.Port < 0 || p.Port > 65535 {
+		c.JSON(http.StatusOK, response.ErrMsg("port 范围错误"))
 		return
 	}
 	var node model.Node
@@ -635,7 +1214,11 @@ func NodeEnableGostAPI(c *gin.Context) {
 		c.JSON(http.StatusOK, response.ErrMsg("节点不存在"))
 		return
 	}
-	_ = sendWSCommand(node.ID, "EnableGostAPI", map[string]any{"from": "manual"})
+	payload := map[string]any{"from": "manual"}
+	if p.Port > 0 {
+		payload["port"] = p.Port
+	}
+	_ = sendWSCommand(node.ID, "EnableGostAPI", payload)
 	c.JSON(http.StatusOK, response.OkNoData())
 }
 

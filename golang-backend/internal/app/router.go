@@ -1,7 +1,11 @@
 package app
 
 import (
+	"mime"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 
 	"network-panel/golang-backend/docs"
@@ -79,6 +83,7 @@ func RegisterRoutes(r *gin.Engine) {
 
 	// flow endpoints (public, no auth)
 	api.Any("/flow/upload", controller.FlowUpload)
+	api.Any("/flow/docker", controller.FlowAnyTLSUpload)
 	api.Any("/flow/anytls", controller.FlowAnyTLSUpload)
 	api.Any("/flow/exit", controller.FlowExitUpload)
 
@@ -100,6 +105,15 @@ func RegisterRoutes(r *gin.Engine) {
 		node.POST("/set-exit", controller.NodeSetExit)
 		// get last saved exit settings for node
 		node.POST("/get-exit", controller.NodeGetExit)
+		// get/ensure anytls cert info for node
+		node.POST("/docker-cert-preview", controller.NodeAnyTLSCertPreview)
+		node.POST("/anytls-cert-preview", controller.NodeAnyTLSCertPreview)
+		// actively verify node anytls cert chain against controller CA
+		node.POST("/docker-cert-chain-check", controller.NodeAnyTLSCertChainCheck)
+		node.POST("/anytls-cert-chain-check", controller.NodeAnyTLSCertChainCheck)
+		// force reissue anytls cert and push to agent immediately
+		node.POST("/docker-cert-reissue", controller.NodeAnyTLSCertReissue)
+		node.POST("/anytls-cert-reissue", controller.NodeAnyTLSCertReissue)
 		// read gost config content
 		node.POST("/gost-config", controller.NodeGostConfig)
 		// NodeQuality test trigger/result
@@ -113,6 +127,12 @@ func RegisterRoutes(r *gin.Engine) {
 		node.POST("/sysinfo", controller.NodeSysinfo)
 		node.POST("/interfaces", controller.NodeInterfaces)
 		node.POST("/ops", controller.NodeOps)
+		node.POST("/docker-cert-logs", controller.NodeAnyTLSCertLogs)
+		node.POST("/anytls-cert-logs", controller.NodeAnyTLSCertLogs)
+		node.POST("/docker-runtime-logs", controller.NodeAnyTLSRuntimeLogs)
+		node.POST("/anytls-runtime-logs", controller.NodeAnyTLSRuntimeLogs)
+		node.POST("/docker-logs", controller.NodeAnyTLSRuntimeLogs)
+		node.POST("/anytls-logs", controller.NodeAnyTLSRuntimeLogs)
 		node.POST("/restart-gost", controller.NodeRestartGost)
 		node.POST("/enable-gost-api", controller.NodeEnableGostAPI)
 		node.POST("/self-check", controller.NodeSelfCheck)
@@ -129,6 +149,9 @@ func RegisterRoutes(r *gin.Engine) {
 			nodeAdm.POST("/user/usage", controller.NodeUserUsageByNode)
 			nodeAdm.POST("/user/remove", controller.NodeUserRemove)
 			nodeAdm.POST("/user/update", controller.NodeUserUpdate)
+			nodeAdm.POST("/agent-upgrade-batch", controller.NodeAgentUpgradeBatch)
+			nodeAdm.POST("/pprof/control", controller.NodePprofControl)
+			nodeAdm.POST("/pprof/fetch", controller.NodePprofFetch)
 		}
 	}
 	// Terminal WS: 自带 token/admin 校验，不使用 Auth 中间件
@@ -228,8 +251,20 @@ func RegisterRoutes(r *gin.Engine) {
 		sub.GET("/shadowrocket", controller.SubscriptionShadowrocket)
 		sub.GET("/surge", controller.SubscriptionSurge)
 		sub.GET("/singbox", controller.SubscriptionSingbox)
+		sub.GET("/docker-ca", controller.SubscriptionAnyTLSCA)
+		sub.GET("/anytls-ca", controller.SubscriptionAnyTLSCA)
+		sub.GET("/docker-ca/check", controller.SubscriptionAnyTLSCACheck)
+		sub.GET("/anytls-ca/check", controller.SubscriptionAnyTLSCACheck)
 		sub.GET("/v2ray", controller.SubscriptionV2ray)
 		sub.GET("/qx", controller.SubscriptionQX)
+		subAdmin := sub.Group("")
+		subAdmin.Use(middleware.RequireRole())
+		{
+			subAdmin.GET("/docker-ca/status", controller.SubscriptionAnyTLSCAStatus)
+			subAdmin.GET("/anytls-ca/status", controller.SubscriptionAnyTLSCAStatus)
+			subAdmin.POST("/docker-ca/generate", controller.SubscriptionAnyTLSCAGenerate)
+			subAdmin.POST("/anytls-ca/generate", controller.SubscriptionAnyTLSCAGenerate)
+		}
 	}
 
 	// heartbeat inventory (agents/controllers)
@@ -262,6 +297,7 @@ func RegisterRoutes(r *gin.Engine) {
 	r.POST("/flow/config", controller.FlowConfig)
 	r.Any("/flow/test", controller.FlowTest)
 	r.Any("/flow/upload", controller.FlowUpload)
+	r.Any("/flow/docker", controller.FlowAnyTLSUpload)
 	r.Any("/flow/anytls", controller.FlowAnyTLSUpload)
 	r.Any("/flow/exit", controller.FlowExitUpload)
 	// limiter plugin endpoint for gost HTTP plugin data source
@@ -279,8 +315,76 @@ func RegisterRoutes(r *gin.Engine) {
 		probe.POST("/delete", controller.ProbeDelete)
 	}
 
-	// serve static frontend under /app to avoid root conflicts
-	r.Static("/app", "./public")
+	// Serve frontend under /app using one catch-all route to avoid Gin wildcard
+	// conflicts. Files are read fully before response to avoid
+	// ERR_CONTENT_LENGTH_MISMATCH while replacing dist files during deploy.
+	serveApp := func(c *gin.Context) {
+		raw := strings.TrimPrefix(c.Param("filepath"), "/")
+		if raw == "" {
+			raw = "index.html"
+		}
+		clean := filepath.Clean(raw)
+		if clean == "." {
+			clean = "index.html"
+		}
+		if strings.HasPrefix(clean, "..") || strings.Contains(clean, ".."+string(os.PathSeparator)) {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "msg": "invalid path"})
+			return
+		}
+
+		serveFile := func(full string, cache string) bool {
+			st, err := os.Stat(full)
+			if err != nil || st.IsDir() {
+				return false
+			}
+			ext := strings.ToLower(filepath.Ext(full))
+			ct := mime.TypeByExtension(ext)
+			if ct == "" {
+				ct = "application/octet-stream"
+			}
+			c.Header("Cache-Control", cache)
+			c.Header("Vary", "Accept-Encoding")
+			if c.Request.Method == http.MethodHead {
+				c.Header("Content-Type", ct)
+				c.Header("Content-Length", strconv.FormatInt(st.Size(), 10))
+				c.Status(http.StatusOK)
+				return true
+			}
+			b, err := os.ReadFile(full)
+			if err != nil {
+				return false
+			}
+			c.Data(http.StatusOK, ct, b)
+			return true
+		}
+
+		full := filepath.Join("public", clean)
+		assetPrefix := "assets" + string(os.PathSeparator)
+		if strings.HasPrefix(clean, assetPrefix) || strings.HasPrefix(clean, "assets/") {
+			if serveFile(full, "public, max-age=31536000, immutable") {
+				return
+			}
+			c.JSON(http.StatusNotFound, gin.H{"code": 404, "msg": "not found"})
+			return
+		}
+
+		if serveFile(full, "no-cache") {
+			return
+		}
+
+		// SPA fallback for routes like /app/forward/new; but keep real missing
+		// files (with extension) as 404.
+		if filepath.Ext(clean) == "" {
+			if serveFile(filepath.Join("public", "index.html"), "no-cache") {
+				return
+			}
+		}
+		c.JSON(http.StatusNotFound, gin.H{"code": 404, "msg": "not found"})
+	}
+	r.GET("/app", serveApp)
+	r.HEAD("/app", serveApp)
+	r.GET("/app/*filepath", serveApp)
+	r.HEAD("/app/*filepath", serveApp)
 
 	// SPA fallback for /app paths; return JSON 404 for others
 	r.NoRoute(func(c *gin.Context) {
@@ -304,6 +408,8 @@ func RegisterRoutes(r *gin.Engine) {
 		agent.POST("/reconcile", controller.AgentReconcile)
 		agent.POST("/remove-services", controller.AgentRemoveServices)
 		agent.POST("/report-services", controller.AgentReportServices)
+		agent.POST("/docker-cert", controller.AgentAnyTLSCert)
+		agent.POST("/anytls-cert", controller.AgentAnyTLSCert)
 		// 手动重新应用全部服务（仅管理员可调用）
 		agent.POST("/reconcile-node", middleware.RequireRole(), controller.AgentReconcileNode)
 		agent.POST("/probe-targets", controller.AgentProbeTargets)

@@ -173,8 +173,11 @@ export const diagnoseForwardStep = (forwardId: number, step: string) =>
   Network.post("/forward/diagnose-step", { forwardId, step });
 export const restartGost = (nodeId: number) =>
   Network.post("/node/restart-gost", { nodeId });
-export const enableGostApi = (nodeId: number) =>
-  Network.post("/node/enable-gost-api", { nodeId });
+export const enableGostApi = (nodeId: number, port?: number) =>
+  Network.post("/node/enable-gost-api", {
+    nodeId,
+    ...(typeof port === "number" && port > 0 ? { port } : {}),
+  });
 
 // 出口节点（含外部）
 export const getExitNodes = () => Network.post("/exit/list");
