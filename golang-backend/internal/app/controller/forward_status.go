@@ -75,7 +75,7 @@ func ForwardStatusList(c *gin.Context) {
 			Type:       r.TType,
 			Protocol:   r.Protocol,
 		}
-		if isDirectExitForward(tun, r.InPort) {
+		if shouldSkipGostServiceForForward(tun, r.Forward) {
 			list = append(list, item{ForwardID: r.ID, Ok: true, SubscriptionOnly: true})
 			continue
 		}
@@ -235,7 +235,7 @@ func ForwardStatusDetail(c *gin.Context) {
 		Nodes            []nodeItem `json:"nodes"`
 	}{ForwardID: f.ID}
 
-	if isDirectExitForward(t, f.InPort) {
+	if shouldSkipGostServiceForForward(t, f) {
 		out.SubscriptionOnly = true
 		c.JSON(http.StatusOK, response.Ok(out))
 		return

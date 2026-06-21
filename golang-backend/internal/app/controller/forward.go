@@ -238,7 +238,7 @@ func ForwardCreate(c *gin.Context) {
 	// push to node(s)
 	opId := RandUUID()
 	name := buildServiceName(f.ID, f.UserID, f.TunnelID)
-	if isDirectExitForward(tun, f.InPort) {
+	if shouldSkipGostServiceForForward(tun, f) {
 		c.JSON(http.StatusOK, response.Ok(map[string]any{"requestId": opId}))
 		return
 	}
@@ -1227,7 +1227,7 @@ func ForwardUpdate(c *gin.Context) {
 	} else {
 		// port-forward (type=1): support multi-level path similar to create
 		path := getTunnelPathNodes(tun.ID)
-		if isDirectExitForward(tun, f.InPort) && len(path) == 0 {
+		if shouldSkipGostServiceForForward(tun, f) && len(path) == 0 {
 			_ = sendWSCommand(tun.InNodeID, "DeleteService", map[string]any{"services": expandNamesWithRUDP([]string{name})})
 			c.JSON(http.StatusOK, response.Ok(map[string]any{"msg": "端口转发更新成功", "requestId": opId}))
 			return
@@ -1627,7 +1627,7 @@ func ForwardPause(c *gin.Context) {
 	// send pause to node(s)
 	var t model.Tunnel
 	if err := dbpkg.DB.First(&t, f.TunnelID).Error; err == nil {
-		if !isDirectExitForward(t, f.InPort) {
+		if !shouldSkipGostServiceForForward(t, f) {
 			name := buildServiceName(f.ID, f.UserID, f.TunnelID)
 			_ = sendWSCommand(t.InNodeID, "PauseService", map[string]interface{}{"services": expandNamesWithRUDP([]string{name})})
 			if t.Type == 2 && !isExternalExit(t) {
@@ -1664,7 +1664,7 @@ func ForwardResume(c *gin.Context) {
 	// send resume to node(s)
 	var t model.Tunnel
 	if err := dbpkg.DB.First(&t, f.TunnelID).Error; err == nil {
-		if !isDirectExitForward(t, f.InPort) {
+		if !shouldSkipGostServiceForForward(t, f) {
 			name := buildServiceName(f.ID, f.UserID, f.TunnelID)
 			_ = sendWSCommand(t.InNodeID, "ResumeService", map[string]interface{}{"services": expandNamesWithRUDP([]string{name})})
 			if t.Type == 2 && !isExternalExit(t) {
@@ -1714,7 +1714,7 @@ func ForwardDiagnose(c *gin.Context) {
 	}
 	var t model.Tunnel
 	_ = dbpkg.DB.First(&t, f.TunnelID).Error
-	if isDirectExitForward(t, f.InPort) {
+	if shouldSkipGostServiceForForward(t, f) {
 		c.JSON(http.StatusOK, response.ErrMsg("仅订阅线路，无需诊断"))
 		return
 	}
@@ -2032,7 +2032,7 @@ func ForwardDiagnoseStep(c *gin.Context) {
 	}
 	var t model.Tunnel
 	_ = dbpkg.DB.First(&t, f.TunnelID).Error
-	if isDirectExitForward(t, f.InPort) {
+	if shouldSkipGostServiceForForward(t, f) {
 		c.JSON(http.StatusOK, response.ErrMsg("仅订阅线路，无需诊断"))
 		return
 	}
@@ -3350,6 +3350,13 @@ func isDirectExitForward(t model.Tunnel, inPort int) bool {
 	return directPort > 0 && inPort == directPort
 }
 
+func shouldSkipGostServiceForForward(t model.Tunnel, f model.Forward) bool {
+	if isAnyTLSTunnel(t) && t.Type == 1 && t.OutNodeID != nil && *t.OutNodeID == t.InNodeID && f.OutPort != nil && *f.OutPort > 0 && f.InPort == *f.OutPort {
+		return true
+	}
+	return isDirectExitForward(t, f.InPort)
+}
+
 func isAnyTLSTunnel(t model.Tunnel) bool {
 	return strings.EqualFold(strings.TrimSpace(ptrString(t.Protocol)), "anytls")
 }
@@ -3379,7 +3386,7 @@ func prepareForwardAnyTLSInstance(t *model.Tunnel, f *model.Forward, requestedOu
 	if t.OutNodeID == nil || *t.OutNodeID <= 0 {
 		return nil
 	}
-	if isDirectExitForward(*t, f.InPort) {
+	if shouldSkipGostServiceForForward(*t, *f) {
 		return nil
 	}
 	outNodeID := *t.OutNodeID
@@ -3510,7 +3517,7 @@ func cleanupForwardAnyTLSInstance(t model.Tunnel, f model.Forward) {
 	if !isAnyTLSTunnel(t) || t.OutNodeID == nil || *t.OutNodeID <= 0 || f.OutPort == nil || *f.OutPort <= 0 {
 		return
 	}
-	if isDirectExitForward(t, f.InPort) {
+	if shouldSkipGostServiceForForward(t, f) {
 		return
 	}
 	outNodeID := *t.OutNodeID
