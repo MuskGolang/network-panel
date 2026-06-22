@@ -25,6 +25,10 @@ ENV CGO_ENABLED=0 \
 COPY . ./
 
 # 不再执行 apk add（避免拉取索引失败）
+# Sync vendor metadata before using -mod=vendor. The repository vendor tree can
+# lag behind go.mod in release archives, which otherwise makes Docker builds
+# fail with "inconsistent vendoring" before compilation starts.
+RUN go mod vendor
 # 构建 server（纯 Go）
 RUN CGO_ENABLED=0 go build -trimpath -mod=vendor -buildvcs=false -ldflags "-w -s -buildid=" -o /app/server ./golang-backend/cmd/server
 # 构建 launcher
