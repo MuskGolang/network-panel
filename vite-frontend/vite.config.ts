@@ -48,39 +48,17 @@ export default defineConfig({
           if (pkg.startsWith("@") && segs.length > 1) {
             pkg = `${pkg}/${segs[1]}`;
           }
-          if (pkg === "react" || pkg === "react-dom" || pkg === "react-is" || pkg === "scheduler") {
-            return "react";
-          }
-          if (
-            pkg.startsWith("@heroui/") ||
-            pkg.startsWith("@nextui-org/") ||
-            pkg.startsWith("@react-aria/") ||
-            pkg.startsWith("@react-stately/") ||
-            pkg.startsWith("@react-types/") ||
-            pkg.startsWith("@internationalized/") ||
-            pkg === "framer-motion"
-          ) {
-            return "ui";
-          }
-          if (pkg.startsWith("@dnd-kit/") || pkg === "react-beautiful-dnd") {
-            return "dnd";
-          }
+
+          // Keep React/UI ecosystems in Rollup's natural chunk graph. Splitting
+          // framer-motion/HeroUI/React into separate manual chunks produced
+          // circular chunks (ui -> vendor -> ui) and runtime TDZ errors such as
+          // "Cannot access 'Ha' before initialization" in production.
           if (pkg === "echarts" || pkg === "recharts") {
             return "charts";
           }
           if (pkg === "xterm") {
             return "xterm";
           }
-          if (pkg === "react-hot-toast" || pkg === "sonner") {
-            return "toast";
-          }
-          if (pkg === "axios") {
-            return "http";
-          }
-          if (pkg === "dayjs") {
-            return "date";
-          }
-          return "vendor";
         },
       },
     },

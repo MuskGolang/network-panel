@@ -6,6 +6,6 @@ docker build --target final -t network-panel:latest .
 docker tag network-panel:latest 24802117/network-panel:latest
 docker push 24802117/network-panel:latest
 
-docker tag network-panel:latest 24802117/network-panel:v2.0.0.5
-docker push 24802117/network-panel:v2.0.0.5
+docker tag network-panel:latest 24802117/network-panel:v2.0.0.6
+docker push 24802117/network-panel:v2.0.0.6
 
