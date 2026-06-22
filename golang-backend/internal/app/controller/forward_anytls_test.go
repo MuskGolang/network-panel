@@ -10,6 +10,32 @@ import (
 	dbpkg "network-panel/golang-backend/internal/db"
 )
 
+func TestShouldSkipGostServiceForForward_LocalAnyTLSPortUsesRuntimeOnly(t *testing.T) {
+	setupForwardAnyTLSTestDB(t)
+	if err := dbpkg.DB.Create(&model.AnyTLSSetting{NodeID: 116, Port: 10087, Password: "secret"}).Error; err != nil {
+		t.Fatalf("seed anytls setting: %v", err)
+	}
+	forward := model.Forward{InPort: 10087, RemoteAddr: "82.158.226.99:10087"}
+	tunnel := model.Tunnel{Type: 1, InNodeID: 116}
+
+	if !shouldSkipGostServiceForForward(tunnel, forward) {
+		t.Fatalf("local AnyTLS runtime port should not create a GOST :%d forward", forward.InPort)
+	}
+}
+
+func TestShouldSkipGostServiceForForward_LocalNonAnyTLSPortStillUsesGost(t *testing.T) {
+	setupForwardAnyTLSTestDB(t)
+	if err := dbpkg.DB.Create(&model.AnyTLSSetting{NodeID: 116, Port: 10087, Password: "secret"}).Error; err != nil {
+		t.Fatalf("seed anytls setting: %v", err)
+	}
+	forward := model.Forward{InPort: 10088, RemoteAddr: "82.158.226.99:10087"}
+	tunnel := model.Tunnel{Type: 1, InNodeID: 116}
+
+	if shouldSkipGostServiceForForward(tunnel, forward) {
+		t.Fatalf("non-AnyTLS local port should still create a GOST forward")
+	}
+}
+
 func TestShouldSkipGostServiceForForward_AnyTLSTunnelUsesRuntimeOnly(t *testing.T) {
 	setupForwardAnyTLSTestDB(t)
 	protocol := "anytls"

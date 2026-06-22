@@ -53,13 +53,17 @@ export default defineConfig(({ mode }) => {
           if (pkg.startsWith("@") && segs.length > 1) {
             pkg = `${pkg}/${segs[1]}`;
           }
+          if (pkg === "react" || pkg === "react-dom" || pkg === "react-is" || pkg === "scheduler") {
+            return "react";
+          }
           if (
             pkg.startsWith("@heroui/") ||
             pkg.startsWith("@nextui-org/") ||
             pkg.startsWith("@react-aria/") ||
             pkg.startsWith("@react-stately/") ||
             pkg.startsWith("@react-types/") ||
-            pkg.startsWith("@internationalized/")
+            pkg.startsWith("@internationalized/") ||
+            pkg === "framer-motion"
           ) {
             return "ui";
           }
@@ -71,9 +75,6 @@ export default defineConfig(({ mode }) => {
           }
           if (pkg === "xterm") {
             return "xterm";
-          }
-          if (pkg === "framer-motion") {
-            return "motion";
           }
           if (pkg === "react-hot-toast" || pkg === "sonner") {
             return "toast";

@@ -3350,7 +3350,26 @@ func isDirectExitForward(t model.Tunnel, inPort int) bool {
 	return directPort > 0 && inPort == directPort
 }
 
+func isAnyTLSRuntimePort(nodeID int64, port int) bool {
+	if nodeID <= 0 || port <= 0 {
+		return false
+	}
+	for _, pm := range listAnyTLSPortMappings(nodeID) {
+		if pm.Port == port {
+			return true
+		}
+	}
+	var at model.AnyTLSSetting
+	if err := dbpkg.DB.Where("node_id = ?", nodeID).First(&at).Error; err == nil {
+		return at.Port == port
+	}
+	return false
+}
+
 func shouldSkipGostServiceForForward(t model.Tunnel, f model.Forward) bool {
+	if isAnyTLSRuntimePort(t.InNodeID, f.InPort) {
+		return true
+	}
 	if isAnyTLSTunnel(t) && t.Type == 1 && t.OutNodeID != nil && *t.OutNodeID == t.InNodeID && f.OutPort != nil && *f.OutPort > 0 && f.InPort == *f.OutPort {
 		return true
 	}
